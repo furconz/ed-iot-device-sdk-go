@@ -1,0 +1,74 @@
+---
+# Greengrass component recipe for Echo Component
+# This demonstrates a complete component configuration
+
+RecipeFormatVersion: "2020-01-25"
+ComponentName: com.example.EchoComponent
+ComponentVersion: "1.0.0"
+ComponentDescription: "Example Go component that echoes messages from IoT Core"
+ComponentPublisher: Example Corp
+ComponentConfiguration:
+  DefaultConfiguration:
+    inputTopic: "echo/input"
+    outputTopic: "echo/output"
+    qos: "AT_LEAST_ONCE"
+    prefix: "[Echo]"
+    logIntervalSeconds: 60
+    accessControl:
+      aws.greengrass.ipc.mqttproxy:
+        "com.example.EchoComponent:mqttproxy:1":
+          policyDescription: "Allows access to publish and subscribe to IoT Core topics"
+          operations:
+            - "aws.greengrass#PublishToIoTCore"
+            - "aws.greengrass#SubscribeToIoTCore"
+          resources:
+            - "echo/input"
+            - "echo/output"
+      aws.greengrass.ipc.pubsub:
+        "com.example.EchoComponent:pubsub:1":
+          policyDescription: "Allows access to local pub/sub"
+          operations:
+            - "aws.greengrass#PublishToTopic"
+            - "aws.greengrass#SubscribeToTopic"
+          resources:
+            - "echo/*"
+
+ComponentDependencies:
+  aws.greengrass.Nucleus:
+    VersionRequirement: ">=2.0.0"
+    DependencyType: HARD
+
+Manifests:
+  - Platform:
+      os: linux
+    Lifecycle:
+      Install: |
+        # Download and install the component binary
+        echo "Installing Echo Component..."
+
+      Run: |
+        # Run the component
+        {install:path}/echo-component
+
+      Shutdown:
+        Script: |
+          # Component will handle graceful shutdown via SIGTERM
+          echo "Stopping Echo Component..."
+        Timeout: 30
+
+  - Platform:
+      os: windows
+    Lifecycle:
+      Install: |
+        # Download and install the component binary
+        echo "Installing Echo Component..."
+
+      Run: |
+        # Run the component
+        {install:path}\echo-component.exe
+
+      Shutdown:
+        Script: |
+          # Component will handle graceful shutdown
+          echo "Stopping Echo Component..."
+        Timeout: 30

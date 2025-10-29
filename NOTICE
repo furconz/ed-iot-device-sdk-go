@@ -1,0 +1,18 @@
+AWS IoT Device SDK for Go v2
+Copyright 2025
+
+This product includes software developed as a derivative work of:
+
+AWS IoT Device SDK for Python v2
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+Licensed under the Apache License 2.0
+https://github.com/aws/aws-iot-device-sdk-python-v2
+
+AWS IoT Device SDK for JavaScript v2
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+Licensed under the Apache License 2.0
+https://github.com/aws/aws-iot-device-sdk-js-v2
+
+This Go implementation follows the protocols, API patterns, and design
+principles established by the official AWS SDKs, adapted for the Go
+programming language and its idioms.
