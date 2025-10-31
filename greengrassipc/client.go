@@ -43,6 +43,7 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 		if cfg.SocketPath == "" {
 			return nil, fmt.Errorf("socket path not provided and AWS_GG_NUCLEUS_DOMAIN_SOCKET_FILEPATH_FOR_COMPONENT not set")
 		}
+		fmt.Printf("[IPC DEBUG] Using socket path from env: %s\n", cfg.SocketPath)
 	}
 
 	// Auto-detect auth token from environment if not provided
@@ -51,6 +52,7 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 		if cfg.AuthToken == "" {
 			return nil, fmt.Errorf("auth token not provided and SVCUID not set")
 		}
+		fmt.Printf("[IPC DEBUG] Using auth token from env (length=%d)\n", len(cfg.AuthToken))
 	}
 
 	// Connect to IPC

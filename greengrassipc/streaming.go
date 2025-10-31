@@ -83,12 +83,17 @@ func (s *Subscription[T]) processMessages() {
 
 		case msg := <-s.stream.Messages():
 			if msg == nil {
+				fmt.Printf("[IPC DEBUG] Subscription received nil message from stream\n")
 				return
 			}
+
+			fmt.Printf("[IPC DEBUG] Subscription processing message (payloadLen=%d)\n", len(msg.Payload))
 
 			// Deserialize the message payload
 			var event T
 			if err := json.Unmarshal(msg.Payload, &event); err != nil {
+				fmt.Printf("[IPC DEBUG] Subscription unmarshal error: %v\n", err)
+				fmt.Printf("[IPC DEBUG]   Payload: %s\n", string(msg.Payload))
 				select {
 				case s.errors <- fmt.Errorf("failed to unmarshal message: %w", err):
 				case <-s.ctx.Done():
@@ -97,10 +102,15 @@ func (s *Subscription[T]) processMessages() {
 				continue
 			}
 
+			fmt.Printf("[IPC DEBUG] Subscription successfully deserialized message\n")
+
 			// Send the event to the messages channel
+			fmt.Printf("[IPC DEBUG] Subscription sending message to channel...\n")
 			select {
 			case s.messages <- event:
+				fmt.Printf("[IPC DEBUG] Subscription message sent to channel successfully\n")
 			case <-s.ctx.Done():
+				fmt.Printf("[IPC DEBUG] Subscription context cancelled while sending\n")
 				return
 			}
 		}

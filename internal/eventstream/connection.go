@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
+	"log"
 	"net"
 	"sync"
 )
@@ -45,6 +45,7 @@ type Stream struct {
 
 	mu       sync.Mutex
 	active   bool
+	closed   bool // tracks if done channel has been closed
 	messages chan *Message
 	errors   chan error
 	done     chan struct{}
@@ -52,16 +53,19 @@ type Stream struct {
 
 // Connect establishes a new EventStream RPC connection
 func Connect(ctx context.Context, config ConnectionConfig) (*Connection, error) {
+	fmt.Printf("[IPC DEBUG] Connecting to socket: %s\n", config.SocketPath)
 	// Connect to Unix domain socket
 	dialer := &net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "unix", config.SocketPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to socket: %w", err)
 	}
+	fmt.Printf("[IPC DEBUG] Socket connected successfully\n")
 
 	c := &Connection{
 		conn:          conn,
 		authToken:     config.AuthToken,
+		nextStreamID:  1, // Stream ID 0 is reserved for connection-level messages
 		activeStreams: make(map[uint32]*Stream),
 		incoming:      make(chan *Message, 100),
 	}
@@ -94,10 +98,19 @@ func (c *Connection) handshake(ctx context.Context) error {
 	connectMsg := CreateMessage(MessageTypeConnect, MessageFlagNone, payload)
 	connectMsg.SetHeader(":version", HeaderTypeString, "0.1.0")
 
+	fmt.Printf("[IPC DEBUG] Sending CONNECT message: type=%v flags=%v headers=%v payloadLen=%d\n",
+		connectMsg.Type, connectMsg.Flags, len(connectMsg.Headers), len(connectMsg.Payload))
+
+	for i, h := range connectMsg.Headers {
+		fmt.Printf("[IPC DEBUG] Sending Header[%d]: name=%s type=%d value=%v\n", i, h.Name, h.Type, h.Value)
+	}
+
 	// Send CONNECT
 	if err := c.writeMessage(connectMsg); err != nil {
 		return fmt.Errorf("failed to send CONNECT: %w", err)
 	}
+
+	fmt.Printf("[IPC DEBUG] CONNECT sent, waiting for CONNACK...\n")
 
 	// Read CONNACK with timeout
 	connackChan := make(chan *Message, 1)
@@ -118,6 +131,28 @@ func (c *Connection) handshake(ctx context.Context) error {
 	case err := <-errChan:
 		return fmt.Errorf("failed to read CONNACK: %w", err)
 	case msg := <-connackChan:
+		fmt.Printf("[IPC DEBUG] Received message: type=%v (%d) flags=%v headers=%v payloadLen=%d\n",
+			msg.Type, uint32(msg.Type), msg.Flags, len(msg.Headers), len(msg.Payload))
+
+		for i, h := range msg.Headers {
+			fmt.Printf("[IPC DEBUG] Header[%d]: name=%s type=%d value=%v\n", i, h.Name, h.Type, h.Value)
+		}
+
+		if len(msg.Payload) > 0 {
+			fmt.Printf("[IPC DEBUG] Payload: %s\n", string(msg.Payload))
+		}
+
+		if msg.Type == MessageTypeProtocolError || msg.Type == MessageTypeInternalError {
+			errorType, _ := msg.GetStringHeader("service-model-type")
+			contentType, _ := msg.GetStringHeader(":content-type")
+			errorMsg := string(msg.Payload)
+			log.Printf("[IPC ERROR] Handshake failed - %v from server", msg.Type)
+			log.Printf("[IPC ERROR]   Error Type: %s", errorType)
+			log.Printf("[IPC ERROR]   Content Type: %s", contentType)
+			log.Printf("[IPC ERROR]   Payload: %s", errorMsg)
+			return fmt.Errorf("%v from server: type=%s contentType=%s message=%s", msg.Type, errorType, contentType, errorMsg)
+		}
+
 		if msg.Type != MessageTypeConnectAck {
 			return fmt.Errorf("expected CONNACK, got %v", msg.Type)
 		}
@@ -134,6 +169,7 @@ func (c *Connection) readLoop() {
 	for {
 		msg, err := DecodeMessage(c.conn)
 		if err != nil {
+			fmt.Printf("[IPC DEBUG] DecodeMessage error: %v\n", err)
 			c.readMu.Lock()
 			c.readErr = err
 			c.readMu.Unlock()
@@ -145,7 +181,12 @@ func (c *Connection) readLoop() {
 				case stream.errors <- err:
 				default:
 				}
-				close(stream.done)
+				stream.mu.Lock()
+				if !stream.closed {
+					close(stream.done)
+					stream.closed = true
+				}
+				stream.mu.Unlock()
 			}
 			c.mu.Unlock()
 
@@ -153,13 +194,79 @@ func (c *Connection) readLoop() {
 			return
 		}
 
-		// Route message to appropriate stream or incoming channel
-		// For now, just send to incoming channel
-		// In a full implementation, we'd need stream IDs to route messages
-		select {
-		case c.incoming <- msg:
-		default:
-			// Channel full, log warning
+		// Log EVERY message received before any processing
+		fmt.Printf("[IPC DEBUG] Raw message received: type=%s flags=%s payloadLen=%d headerCount=%d\n",
+			msg.Type, msg.Flags, len(msg.Payload), len(msg.Headers))
+
+		// Extract stream ID from message headers to route it correctly
+		streamID := uint32(0)
+		for _, h := range msg.Headers {
+			if h.Name == ":stream-id" {
+				if v, ok := h.Value.(int32); ok {
+					streamID = uint32(v)
+				}
+			}
+		}
+
+		fmt.Printf("[IPC DEBUG] Received message for stream %d: type=%s flags=%s\n",
+			streamID, msg.Type, msg.Flags)
+
+		// Route message to appropriate stream
+		c.mu.Lock()
+		stream, exists := c.activeStreams[streamID]
+		c.mu.Unlock()
+
+		if exists {
+			// Check for error response FIRST (before checking termination flag)
+			// This ensures we log the error even if TERMINATE_STREAM flag is also set
+			if msg.Type == MessageTypeApplicationError {
+				err := c.parseErrorMessage(msg)
+				log.Printf("[IPC ERROR] Stream %d received ApplicationError: %v", streamID, err)
+				log.Printf("[IPC ERROR]   Payload: %s", string(msg.Payload))
+				select {
+				case stream.errors <- err:
+				default:
+				}
+				// Don't continue yet - check if we also need to close the stream
+			}
+
+			// Deliver message BEFORE checking termination flag
+			// For request-response, the response has TERMINATE_STREAM flag but still contains the response payload
+			if msg.Type != MessageTypeApplicationError {
+				fmt.Printf("[IPC DEBUG] Routing message to stream %d (payloadLen=%d)\n", streamID, len(msg.Payload))
+				select {
+				case stream.messages <- msg:
+				case <-stream.done:
+					// Stream closed, ignore message
+					fmt.Printf("[IPC DEBUG] Stream %d already closed, dropping message\n", streamID)
+				default:
+					fmt.Printf("[IPC DEBUG] Stream %d message channel full, dropping message\n", streamID)
+				}
+			}
+
+			// NOW check if this is a termination message (after delivering the message)
+			if msg.Flags.HasFlag(MessageFlagTerminateStream) {
+				fmt.Printf("[IPC DEBUG] Stream %d received TERMINATE_STREAM (after message delivery)\n", streamID)
+				stream.mu.Lock()
+				if !stream.closed {
+					close(stream.done)
+					stream.closed = true
+				}
+				stream.mu.Unlock()
+			}
+		} else {
+			// No specific stream, send to incoming channel (connection-level messages)
+			if msg.Type == MessageTypeProtocolError || msg.Type == MessageTypeInternalError {
+				// Log connection-level errors
+				log.Printf("[IPC ERROR] Connection-level error received:")
+				log.Printf("[IPC ERROR]   Type: %s", msg.Type)
+				log.Printf("[IPC ERROR]   Payload: %s", string(msg.Payload))
+			}
+			select {
+			case c.incoming <- msg:
+			default:
+				fmt.Printf("[IPC DEBUG] Incoming channel full, dropping message\n")
+			}
 		}
 	}
 }
@@ -172,6 +279,11 @@ func (c *Connection) writeMessage(msg *Message) error {
 	encoded, err := EncodeMessage(msg)
 	if err != nil {
 		return fmt.Errorf("failed to encode message: %w", err)
+	}
+
+	fmt.Printf("[IPC DEBUG] Writing %d bytes to socket\n", len(encoded))
+	if len(encoded) < 200 {
+		fmt.Printf("[IPC DEBUG] Wire bytes: % x\n", encoded)
 	}
 
 	if _, err := c.conn.Write(encoded); err != nil {
@@ -220,52 +332,66 @@ func (c *Connection) NewStream(operation string) *Stream {
 
 	c.activeStreams[streamID] = stream
 
+	fmt.Printf("[IPC DEBUG] Created stream %d for operation: %s\n", streamID, operation)
+
 	return stream
 }
 
 // RequestResponse performs a simple request-response operation
 func (c *Connection) RequestResponse(ctx context.Context, operation string, request interface{}) ([]byte, error) {
-	// Serialize request
-	payload, err := json.Marshal(request)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	// Create a new stream for this request-response operation
+	stream := c.NewStream(operation)
+
+	// Activate the stream with the request
+	if err := stream.Activate(ctx, request); err != nil {
+		return nil, fmt.Errorf("failed to activate stream: %w", err)
 	}
+	defer stream.Close()
 
-	// Create application message
-	msg := CreateMessage(MessageTypeApplicationMessage, MessageFlagNone, payload)
-	msg.SetHeader("service-model-type", HeaderTypeString, operation)
-
-	// Send request
-	if err := c.writeMessage(msg); err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-
-	// Wait for response
+	// Wait for response message
+	// Note: We don't check stream.Done() here because the server sends TERMINATE_STREAM
+	// flag on the response for request-response operations, which is normal behavior
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case respMsg := <-c.incoming:
-		if respMsg == nil {
-			c.readMu.Lock()
-			err := c.readErr
-			c.readMu.Unlock()
-			if err != nil && err != io.EOF {
-				return nil, fmt.Errorf("connection error: %w", err)
+	case err := <-stream.Errors():
+		if err != nil {
+			return nil, fmt.Errorf("stream error: %w", err)
+		}
+		// Errors channel closed, check for response
+		select {
+		case respMsg := <-stream.Messages():
+			if respMsg == nil {
+				return nil, fmt.Errorf("stream closed without response")
 			}
-			return nil, fmt.Errorf("connection closed")
+			return c.handleResponseMessage(respMsg)
+		default:
+			return nil, fmt.Errorf("stream closed without response")
 		}
-
-		// Check for error response
-		if respMsg.Type == MessageTypeApplicationError {
-			return nil, c.parseErrorMessage(respMsg)
+	case respMsg := <-stream.Messages():
+		if respMsg == nil {
+			return nil, fmt.Errorf("stream closed without response")
 		}
-
-		if respMsg.Type != MessageTypeApplicationMessage {
-			return nil, fmt.Errorf("unexpected message type: %v", respMsg.Type)
-		}
-
-		return respMsg.Payload, nil
+		return c.handleResponseMessage(respMsg)
 	}
+}
+
+func (c *Connection) handleResponseMessage(respMsg *Message) ([]byte, error) {
+	// Check for error response
+	if respMsg.Type == MessageTypeApplicationError {
+		err := c.parseErrorMessage(respMsg)
+		log.Printf("[IPC ERROR] Request-response operation failed: %v", err)
+		log.Printf("[IPC ERROR]   Payload: %s", string(respMsg.Payload))
+		return nil, err
+	}
+
+	if respMsg.Type != MessageTypeApplicationMessage {
+		return nil, fmt.Errorf("unexpected message type: %v", respMsg.Type)
+	}
+
+	// Success - return the response payload
+	// (The TERMINATE_STREAM flag on the response is normal for request-response operations)
+	return respMsg.Payload, nil
 }
 
 // parseErrorMessage parses an error message into an OperationError
@@ -315,9 +441,13 @@ func (s *Stream) Activate(ctx context.Context, request interface{}) error {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Create application message
-	msg := CreateMessage(MessageTypeApplicationMessage, MessageFlagNone, payload)
-	msg.SetHeader("service-model-type", HeaderTypeString, s.operation)
+	fmt.Printf("[IPC DEBUG] Activating stream %d:\n", s.id)
+	fmt.Printf("[IPC DEBUG]   Operation: %s\n", s.operation)
+	fmt.Printf("[IPC DEBUG]   Request payload: %s\n", string(payload))
+
+	// Create application message with stream ID
+	msg := CreateMessageWithStreamID(MessageTypeApplicationMessage, MessageFlagNone, s.id, payload)
+	msg.SetHeader("operation", HeaderTypeString, s.operation)
 
 	// Send request
 	if err := s.conn.writeMessage(msg); err != nil {
@@ -325,53 +455,9 @@ func (s *Stream) Activate(ctx context.Context, request interface{}) error {
 	}
 
 	s.active = true
-
-	// Start receiving messages for this stream
-	go s.receiveLoop()
+	fmt.Printf("[IPC DEBUG] Stream %d activated successfully\n", s.id)
 
 	return nil
-}
-
-// receiveLoop receives messages for this stream
-func (s *Stream) receiveLoop() {
-	for {
-		select {
-		case <-s.done:
-			return
-		case msg := <-s.conn.incoming:
-			if msg == nil {
-				// Connection closed
-				select {
-				case s.errors <- fmt.Errorf("connection closed"):
-				default:
-				}
-				return
-			}
-
-			// Check if this is a termination message
-			if msg.Flags.HasFlag(MessageFlagTerminateStream) {
-				close(s.done)
-				return
-			}
-
-			// Check for error response
-			if msg.Type == MessageTypeApplicationError {
-				err := s.conn.parseErrorMessage(msg)
-				select {
-				case s.errors <- err:
-				default:
-				}
-				continue
-			}
-
-			// Send to messages channel
-			select {
-			case s.messages <- msg:
-			case <-s.done:
-				return
-			}
-		}
-	}
 }
 
 // Messages returns the channel for receiving messages
@@ -398,19 +484,32 @@ func (s *Stream) Close() error {
 		return nil
 	}
 
-	// Send termination message
-	msg := CreateMessage(MessageTypeApplicationMessage, MessageFlagTerminateStream, nil)
-	if err := s.conn.writeMessage(msg); err != nil {
-		// Best effort
+	fmt.Printf("[IPC DEBUG] Closing stream %d (operation: %s)\n", s.id, s.operation)
+
+	// Only send TERMINATE if the stream wasn't already closed by readLoop
+	// If stream.closed is true, readLoop already closed the done channel due to connection error
+	// In that case, don't send TERMINATE (connection may be dead or violates monotonic ordering)
+	if !s.closed {
+		msg := CreateMessageWithStreamID(MessageTypeApplicationMessage, MessageFlagTerminateStream, s.id, nil)
+		if err := s.conn.writeMessage(msg); err != nil {
+			log.Printf("[IPC ERROR] Failed to send TERMINATE for stream %d: %v", s.id, err)
+		} else {
+			fmt.Printf("[IPC DEBUG] Sent TERMINATE for stream %d\n", s.id)
+		}
+		close(s.done)
+		s.closed = true
+	} else {
+		fmt.Printf("[IPC DEBUG] Stream %d already closed by readLoop, skipping TERMINATE\n", s.id)
 	}
 
-	close(s.done)
 	s.active = false
 
 	// Remove from active streams
 	s.conn.mu.Lock()
 	delete(s.conn.activeStreams, s.id)
 	s.conn.mu.Unlock()
+
+	fmt.Printf("[IPC DEBUG] Stream %d closed and removed from active streams\n", s.id)
 
 	return nil
 }

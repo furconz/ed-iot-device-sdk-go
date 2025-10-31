@@ -35,8 +35,8 @@ const (
 
 // EncodeMessage encodes a Message into wire format
 func EncodeMessage(msg *Message) ([]byte, error) {
-	// Encode headers
-	headersBuf, err := encodeHeaders(msg.Headers)
+	// Encode headers (protocol headers first, then user headers)
+	headersBuf, err := encodeHeaders(msg.Headers, msg.Type, msg.Flags)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode headers: %w", err)
 	}
@@ -150,12 +150,38 @@ func DecodeMessage(reader io.Reader) (*Message, error) {
 }
 
 // encodeHeaders encodes headers into wire format
-func encodeHeaders(headers []Header) ([]byte, error) {
-	// Add message-type and flags as special headers
-	// These are encoded as int32 headers with reserved names ":message-type" and ":message-flags"
+// CRITICAL: Protocol headers (:message-type, :message-flags, :stream-id) MUST be encoded FIRST,
+// then user headers. This matches the AWS CRT implementation and is required by the EventStream RPC protocol.
+func encodeHeaders(headers []Header, msgType MessageType, msgFlags MessageFlags) ([]byte, error) {
 	buf := &bytes.Buffer{}
 
+	// Extract stream-id from headers before encoding
+	var streamID int32 = 0
 	for _, h := range headers {
+		if h.Name == ":stream-id" {
+			if v, ok := h.Value.(int32); ok {
+				streamID = v
+			}
+		}
+	}
+
+	// FIRST: Encode protocol headers - these MUST come first!
+	if err := encodeHeader(buf, Header{Name: ":message-type", Type: HeaderTypeInt32, Value: int32(msgType)}); err != nil {
+		return nil, err
+	}
+	if err := encodeHeader(buf, Header{Name: ":message-flags", Type: HeaderTypeInt32, Value: int32(msgFlags)}); err != nil {
+		return nil, err
+	}
+	if err := encodeHeader(buf, Header{Name: ":stream-id", Type: HeaderTypeInt32, Value: streamID}); err != nil {
+		return nil, err
+	}
+
+	// SECOND: Encode user headers (non-protocol headers)
+	for _, h := range headers {
+		// Skip protocol headers if they somehow ended up in the user headers
+		if h.Name == ":message-type" || h.Name == ":message-flags" || h.Name == ":stream-id" {
+			continue
+		}
 		if err := encodeHeader(buf, h); err != nil {
 			return nil, err
 		}
@@ -394,21 +420,23 @@ func decodeHeader(buf *bytes.Reader) (Header, error) {
 }
 
 // CreateMessage is a helper to create a message with type and flags
+// streamID is the stream identifier (0 for connection-level messages)
 func CreateMessage(msgType MessageType, flags MessageFlags, payload []byte) *Message {
+	return CreateMessageWithStreamID(msgType, flags, 0, payload)
+}
+
+// CreateMessageWithStreamID creates a message with a specific stream ID
+func CreateMessageWithStreamID(msgType MessageType, flags MessageFlags, streamID uint32, payload []byte) *Message {
 	msg := &Message{
 		Type:    msgType,
 		Flags:   flags,
 		Payload: payload,
+		// Store stream-id in headers - encodeHeaders will place all protocol headers first
 		Headers: []Header{
 			{
-				Name:  ":message-type",
+				Name:  ":stream-id",
 				Type:  HeaderTypeInt32,
-				Value: int32(msgType),
-			},
-			{
-				Name:  ":message-flags",
-				Type:  HeaderTypeInt32,
-				Value: int32(flags),
+				Value: int32(streamID),
 			},
 		},
 	}

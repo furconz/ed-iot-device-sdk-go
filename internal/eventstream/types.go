@@ -8,20 +8,33 @@ import (
 )
 
 // MessageType represents the type of EventStream message
+// Values MUST match the AWS EventStream RPC protocol specification
 type MessageType uint32
 
 const (
-	// MessageTypeConnect is sent by client to initiate connection
-	MessageTypeConnect MessageType = 0
-
-	// MessageTypeConnectAck is sent by server in response to Connect
-	MessageTypeConnectAck MessageType = 1
-
 	// MessageTypeApplicationMessage is used for operation requests/responses
-	MessageTypeApplicationMessage MessageType = 3
+	MessageTypeApplicationMessage MessageType = 0
 
 	// MessageTypeApplicationError is used for operation errors
-	MessageTypeApplicationError MessageType = 4
+	MessageTypeApplicationError MessageType = 1
+
+	// MessageTypePing is sent to keep connection alive
+	MessageTypePing MessageType = 2
+
+	// MessageTypePingResponse is sent in response to Ping
+	MessageTypePingResponse MessageType = 3
+
+	// MessageTypeConnect is sent by client to initiate connection
+	MessageTypeConnect MessageType = 4
+
+	// MessageTypeConnectAck is sent by server in response to Connect
+	MessageTypeConnectAck MessageType = 5
+
+	// MessageTypeProtocolError indicates a protocol-level error
+	MessageTypeProtocolError MessageType = 6
+
+	// MessageTypeInternalError indicates an internal server error
+	MessageTypeInternalError MessageType = 7
 )
 
 // String returns string representation of MessageType
@@ -31,10 +44,18 @@ func (m MessageType) String() string {
 		return "Connect"
 	case MessageTypeConnectAck:
 		return "ConnectAck"
+	case MessageTypePing:
+		return "Ping"
 	case MessageTypeApplicationMessage:
 		return "ApplicationMessage"
 	case MessageTypeApplicationError:
 		return "ApplicationError"
+	case MessageTypePingResponse:
+		return "PingResponse"
+	case MessageTypeProtocolError:
+		return "ProtocolError"
+	case MessageTypeInternalError:
+		return "InternalError"
 	default:
 		return fmt.Sprintf("Unknown(%d)", m)
 	}

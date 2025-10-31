@@ -16,10 +16,10 @@ type QOS string
 
 const (
 	// QOSAtMostOnce - QoS 0, message delivered at most once, may be lost
-	QOSAtMostOnce QOS = "AT_MOST_ONCE"
+	QOSAtMostOnce QOS = "0"
 
 	// QOSAtLeastOnce - QoS 1, message delivered at least once, may be duplicated
-	QOSAtLeastOnce QOS = "AT_LEAST_ONCE"
+	QOSAtLeastOnce QOS = "1"
 )
 
 // PayloadFormat represents the format of a message payload
