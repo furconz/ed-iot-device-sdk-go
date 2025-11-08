@@ -32,3 +32,8 @@ vendor/
 # Temporary files
 *.tmp
 *.log
+
+# Other language SDK references
+crt-event-stream/
+js/
+python/
