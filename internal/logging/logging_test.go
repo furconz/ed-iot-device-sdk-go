@@ -135,3 +135,22 @@ func TestErrorAlwaysLogs(t *testing.T) {
 		t.Errorf("Expected error output even with debug disabled, got: %q", output)
 	}
 }
+
+func TestInfoAlwaysLogs(t *testing.T) {
+	// Test with debug disabled
+	resetForTesting()
+	os.Unsetenv("IPC_DEBUG")
+	checkDebugEnabled()
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	log.SetFlags(0)
+
+	Info("connection established: %s", "success")
+	output := buf.String()
+
+	if !strings.Contains(output, "[IPC INFO] connection established: success") {
+		t.Errorf("Expected info output even with debug disabled, got: %q", output)
+	}
+}

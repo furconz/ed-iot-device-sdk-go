@@ -49,3 +49,10 @@ func Debug(format string, args ...interface{}) {
 func Error(format string, args ...interface{}) {
 	log.Printf("[IPC ERROR] "+format, args...)
 }
+
+// Info logs informational messages with the IPC INFO prefix.
+// These are always shown regardless of debug settings.
+// Use for important, low-volume lifecycle and configuration events.
+func Info(format string, args ...interface{}) {
+	log.Printf("[IPC INFO] "+format, args...)
+}

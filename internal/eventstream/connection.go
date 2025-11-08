@@ -54,14 +54,14 @@ type Stream struct {
 
 // Connect establishes a new EventStream RPC connection
 func Connect(ctx context.Context, config ConnectionConfig) (*Connection, error) {
-	logging.Debug("Connecting to socket: %s", config.SocketPath)
+	logging.Info("Connecting to socket: %s", config.SocketPath)
 	// Connect to Unix domain socket
 	dialer := &net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "unix", config.SocketPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to socket: %w", err)
 	}
-	logging.Debug("Socket connected successfully")
+	logging.Info("Socket connected successfully")
 
 	c := &Connection{
 		conn:          conn,
@@ -170,7 +170,7 @@ func (c *Connection) readLoop() {
 	for {
 		msg, err := DecodeMessage(c.conn)
 		if err != nil {
-			logging.Debug("DecodeMessage error: %v", err)
+			logging.Error("DecodeMessage error: %v", err)
 			c.readMu.Lock()
 			c.readErr = err
 			c.readMu.Unlock()
@@ -239,9 +239,9 @@ func (c *Connection) readLoop() {
 				case stream.messages <- msg:
 				case <-stream.done:
 					// Stream closed, ignore message
-					logging.Debug("Stream %d already closed, dropping message", streamID)
+					logging.Info("Stream %d already closed, dropping message", streamID)
 				default:
-					logging.Debug("Stream %d message channel full, dropping message", streamID)
+					logging.Error("Stream %d message channel full, dropping message", streamID)
 				}
 			}
 
@@ -266,7 +266,7 @@ func (c *Connection) readLoop() {
 			select {
 			case c.incoming <- msg:
 			default:
-				logging.Debug("Incoming channel full, dropping message")
+				logging.Error("Incoming channel full, dropping message")
 			}
 		}
 	}

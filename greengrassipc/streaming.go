@@ -84,7 +84,7 @@ func (s *Subscription[T]) processMessages() {
 
 		case msg := <-s.stream.Messages():
 			if msg == nil {
-				logging.Debug("Subscription received nil message from stream")
+				logging.Info("Subscription received nil message from stream")
 				return
 			}
 
@@ -93,8 +93,8 @@ func (s *Subscription[T]) processMessages() {
 			// Deserialize the message payload
 			var event T
 			if err := json.Unmarshal(msg.Payload, &event); err != nil {
-				logging.Debug("Subscription unmarshal error: %v", err)
-				logging.Debug("  Payload: %s", string(msg.Payload))
+				logging.Error("Subscription unmarshal error: %v", err)
+				logging.Error("  Payload: %s", string(msg.Payload))
 				select {
 				case s.errors <- fmt.Errorf("failed to unmarshal message: %w", err):
 				case <-s.ctx.Done():

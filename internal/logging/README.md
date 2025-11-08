@@ -1,10 +1,10 @@
 # IPC Logging
 
-This package provides centralized logging for the Greengrass IPC SDK with environment-variable-based debug gating.
+This package provides centralized logging for the Greengrass IPC SDK with three logging levels.
 
-## Usage
+## Logging Levels
 
-### Debug Messages
+### Debug Messages (`logging.Debug()`)
 
 Debug messages are gated behind the `IPC_DEBUG` environment variable. By default, debug messages are **hidden** to reduce log density.
 
@@ -13,16 +13,24 @@ To enable debug messages, set:
 export IPC_DEBUG=on
 ```
 
-Debug messages are prefixed with `[IPC DEBUG]` and include detailed information about:
-- Socket connections and handshakes
+Debug messages are prefixed with `[IPC DEBUG]` and include verbose, high-volume protocol details:
 - Message encoding/decoding
-- Stream lifecycle (creation, activation, termination)
-- Subscription message processing
-- Request/response operations
+- Wire-level protocol details
+- Detailed stream lifecycle events
+- Verbose subscription message processing
 
-### Error Messages
+### Info Messages (`logging.Info()`)
 
-Error messages are **always shown** regardless of the `IPC_DEBUG` setting. They are prefixed with `[IPC ERROR]` and include:
+Info messages are **always shown** regardless of the `IPC_DEBUG` setting. They are prefixed with `[IPC INFO]` and include important, low-volume lifecycle events:
+- Connection establishment
+- Configuration discovery (socket path, auth token from environment)
+- Unexpected conditions (nil messages, closed stream receiving messages)
+
+### Error Messages (`logging.Error()`)
+
+Error messages are **always shown** regardless of the `IPC_DEBUG` setting. They are prefixed with `[IPC ERROR]` and include critical errors:
+- Decode/unmarshal failures
+- Message loss (channel full, dropping messages)
 - Handshake failures
 - Connection-level errors
 - Stream-level application errors
@@ -51,16 +59,21 @@ IPC_DEBUG=on ./your-greengrass-component
 
 ### Sample Output
 
-**Debug Disabled:**
+**Debug Disabled (Default):**
 ```
-[IPC ERROR] Stream 2 received ApplicationError: operation failed
-[IPC ERROR]   Payload: {"errorMessage":"Invalid request"}
+[IPC INFO] Using socket path from env: /greengrass/v2/ipc.socket
+[IPC INFO] Connecting to socket: /greengrass/v2/ipc.socket
+[IPC INFO] Socket connected successfully
+[IPC ERROR] Stream 2 message channel full, dropping message
+[IPC ERROR] Subscription unmarshal error: json: cannot unmarshal string into Go value of type IoTCoreMessage
+[IPC ERROR]   Payload: "invalid json"
 ```
 
-**Debug Enabled:**
+**Debug Enabled (IPC_DEBUG=on):**
 ```
-[IPC DEBUG] Connecting to socket: /tmp/greengrass.sock
-[IPC DEBUG] Socket connected successfully
+[IPC INFO] Using socket path from env: /greengrass/v2/ipc.socket
+[IPC INFO] Connecting to socket: /greengrass/v2/ipc.socket
+[IPC INFO] Socket connected successfully
 [IPC DEBUG] Sending CONNECT message: type=CONNECT flags=0x0 headers=1 payloadLen=45
 [IPC DEBUG] CONNECT sent, waiting for CONNACK...
 [IPC DEBUG] Received message: type=CONNACK (1) flags=0x1 headers=0 payloadLen=0
@@ -69,23 +82,27 @@ IPC_DEBUG=on ./your-greengrass-component
 [IPC DEBUG]   Operation: aws.greengrass#PublishToIoTCore
 [IPC DEBUG]   Request payload: {"topicName":"test/topic","payload":"..."}
 [IPC DEBUG] Stream 1 activated successfully
-[IPC ERROR] Stream 2 received ApplicationError: operation failed
-[IPC ERROR]   Payload: {"errorMessage":"Invalid request"}
+[IPC DEBUG] Raw message received: type=APPLICATION_MESSAGE flags=0x0 payloadLen=128 headerCount=2
+[IPC ERROR] Stream 2 message channel full, dropping message
+[IPC ERROR] Subscription unmarshal error: json: cannot unmarshal string into Go value of type IoTCoreMessage
+[IPC ERROR]   Payload: "invalid json"
 ```
 
 ## Code Structure
 
-- `Debug(format string, args ...interface{})` - Logs debug messages when `IPC_DEBUG=on`
+- `Debug(format string, args ...interface{})` - Logs verbose debug messages when `IPC_DEBUG=on`
+- `Info(format string, args ...interface{})` - Always logs important lifecycle events
 - `Error(format string, args ...interface{})` - Always logs error messages
-- Both functions use `log.Printf` internally with appropriate prefixes
+- All functions use `log.Printf` internally with appropriate prefixes
 
 ## Testing
 
 Tests are included to verify:
 1. Debug messages are hidden by default
 2. Debug messages are shown when `IPC_DEBUG=on`
-3. Error messages are always shown
-4. Performance characteristics when debug is disabled
+3. Info messages are always shown
+4. Error messages are always shown
+5. Performance characteristics when debug is disabled
 
 Run tests with:
 ```bash
