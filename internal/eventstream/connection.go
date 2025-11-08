@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"sync"
+
+	"github.com/furconz/ed-iot-device-sdk-go/internal/logging"
 )
 
 // Connection represents an EventStream RPC connection
@@ -53,14 +54,14 @@ type Stream struct {
 
 // Connect establishes a new EventStream RPC connection
 func Connect(ctx context.Context, config ConnectionConfig) (*Connection, error) {
-	fmt.Printf("[IPC DEBUG] Connecting to socket: %s\n", config.SocketPath)
+	logging.Debug("Connecting to socket: %s", config.SocketPath)
 	// Connect to Unix domain socket
 	dialer := &net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "unix", config.SocketPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to socket: %w", err)
 	}
-	fmt.Printf("[IPC DEBUG] Socket connected successfully\n")
+	logging.Debug("Socket connected successfully")
 
 	c := &Connection{
 		conn:          conn,
@@ -98,11 +99,11 @@ func (c *Connection) handshake(ctx context.Context) error {
 	connectMsg := CreateMessage(MessageTypeConnect, MessageFlagNone, payload)
 	connectMsg.SetHeader(":version", HeaderTypeString, "0.1.0")
 
-	fmt.Printf("[IPC DEBUG] Sending CONNECT message: type=%v flags=%v headers=%v payloadLen=%d\n",
+	logging.Debug("Sending CONNECT message: type=%v flags=%v headers=%v payloadLen=%d",
 		connectMsg.Type, connectMsg.Flags, len(connectMsg.Headers), len(connectMsg.Payload))
 
 	for i, h := range connectMsg.Headers {
-		fmt.Printf("[IPC DEBUG] Sending Header[%d]: name=%s type=%d value=%v\n", i, h.Name, h.Type, h.Value)
+		logging.Debug("Sending Header[%d]: name=%s type=%d value=%v", i, h.Name, h.Type, h.Value)
 	}
 
 	// Send CONNECT
@@ -110,7 +111,7 @@ func (c *Connection) handshake(ctx context.Context) error {
 		return fmt.Errorf("failed to send CONNECT: %w", err)
 	}
 
-	fmt.Printf("[IPC DEBUG] CONNECT sent, waiting for CONNACK...\n")
+	logging.Debug("CONNECT sent, waiting for CONNACK...")
 
 	// Read CONNACK with timeout
 	connackChan := make(chan *Message, 1)
@@ -131,25 +132,25 @@ func (c *Connection) handshake(ctx context.Context) error {
 	case err := <-errChan:
 		return fmt.Errorf("failed to read CONNACK: %w", err)
 	case msg := <-connackChan:
-		fmt.Printf("[IPC DEBUG] Received message: type=%v (%d) flags=%v headers=%v payloadLen=%d\n",
+		logging.Debug("Received message: type=%v (%d) flags=%v headers=%v payloadLen=%d",
 			msg.Type, uint32(msg.Type), msg.Flags, len(msg.Headers), len(msg.Payload))
 
 		for i, h := range msg.Headers {
-			fmt.Printf("[IPC DEBUG] Header[%d]: name=%s type=%d value=%v\n", i, h.Name, h.Type, h.Value)
+			logging.Debug("Header[%d]: name=%s type=%d value=%v", i, h.Name, h.Type, h.Value)
 		}
 
 		if len(msg.Payload) > 0 {
-			fmt.Printf("[IPC DEBUG] Payload: %s\n", string(msg.Payload))
+			logging.Debug("Payload: %s", string(msg.Payload))
 		}
 
 		if msg.Type == MessageTypeProtocolError || msg.Type == MessageTypeInternalError {
 			errorType, _ := msg.GetStringHeader("service-model-type")
 			contentType, _ := msg.GetStringHeader(":content-type")
 			errorMsg := string(msg.Payload)
-			log.Printf("[IPC ERROR] Handshake failed - %v from server", msg.Type)
-			log.Printf("[IPC ERROR]   Error Type: %s", errorType)
-			log.Printf("[IPC ERROR]   Content Type: %s", contentType)
-			log.Printf("[IPC ERROR]   Payload: %s", errorMsg)
+			logging.Error("Handshake failed - %v from server", msg.Type)
+			logging.Error("  Error Type: %s", errorType)
+			logging.Error("  Content Type: %s", contentType)
+			logging.Error("  Payload: %s", errorMsg)
 			return fmt.Errorf("%v from server: type=%s contentType=%s message=%s", msg.Type, errorType, contentType, errorMsg)
 		}
 
@@ -169,7 +170,7 @@ func (c *Connection) readLoop() {
 	for {
 		msg, err := DecodeMessage(c.conn)
 		if err != nil {
-			fmt.Printf("[IPC DEBUG] DecodeMessage error: %v\n", err)
+			logging.Debug("DecodeMessage error: %v", err)
 			c.readMu.Lock()
 			c.readErr = err
 			c.readMu.Unlock()
@@ -195,7 +196,7 @@ func (c *Connection) readLoop() {
 		}
 
 		// Log EVERY message received before any processing
-		fmt.Printf("[IPC DEBUG] Raw message received: type=%s flags=%s payloadLen=%d headerCount=%d\n",
+		logging.Debug("Raw message received: type=%s flags=%s payloadLen=%d headerCount=%d",
 			msg.Type, msg.Flags, len(msg.Payload), len(msg.Headers))
 
 		// Extract stream ID from message headers to route it correctly
@@ -208,7 +209,7 @@ func (c *Connection) readLoop() {
 			}
 		}
 
-		fmt.Printf("[IPC DEBUG] Received message for stream %d: type=%s flags=%s\n",
+		logging.Debug("Received message for stream %d: type=%s flags=%s",
 			streamID, msg.Type, msg.Flags)
 
 		// Route message to appropriate stream
@@ -221,8 +222,8 @@ func (c *Connection) readLoop() {
 			// This ensures we log the error even if TERMINATE_STREAM flag is also set
 			if msg.Type == MessageTypeApplicationError {
 				err := c.parseErrorMessage(msg)
-				log.Printf("[IPC ERROR] Stream %d received ApplicationError: %v", streamID, err)
-				log.Printf("[IPC ERROR]   Payload: %s", string(msg.Payload))
+				logging.Error("Stream %d received ApplicationError: %v", streamID, err)
+				logging.Error("  Payload: %s", string(msg.Payload))
 				select {
 				case stream.errors <- err:
 				default:
@@ -233,20 +234,20 @@ func (c *Connection) readLoop() {
 			// Deliver message BEFORE checking termination flag
 			// For request-response, the response has TERMINATE_STREAM flag but still contains the response payload
 			if msg.Type != MessageTypeApplicationError {
-				fmt.Printf("[IPC DEBUG] Routing message to stream %d (payloadLen=%d)\n", streamID, len(msg.Payload))
+				logging.Debug("Routing message to stream %d (payloadLen=%d)", streamID, len(msg.Payload))
 				select {
 				case stream.messages <- msg:
 				case <-stream.done:
 					// Stream closed, ignore message
-					fmt.Printf("[IPC DEBUG] Stream %d already closed, dropping message\n", streamID)
+					logging.Debug("Stream %d already closed, dropping message", streamID)
 				default:
-					fmt.Printf("[IPC DEBUG] Stream %d message channel full, dropping message\n", streamID)
+					logging.Debug("Stream %d message channel full, dropping message", streamID)
 				}
 			}
 
 			// NOW check if this is a termination message (after delivering the message)
 			if msg.Flags.HasFlag(MessageFlagTerminateStream) {
-				fmt.Printf("[IPC DEBUG] Stream %d received TERMINATE_STREAM (after message delivery)\n", streamID)
+				logging.Debug("Stream %d received TERMINATE_STREAM (after message delivery)", streamID)
 				stream.mu.Lock()
 				if !stream.closed {
 					close(stream.done)
@@ -258,14 +259,14 @@ func (c *Connection) readLoop() {
 			// No specific stream, send to incoming channel (connection-level messages)
 			if msg.Type == MessageTypeProtocolError || msg.Type == MessageTypeInternalError {
 				// Log connection-level errors
-				log.Printf("[IPC ERROR] Connection-level error received:")
-				log.Printf("[IPC ERROR]   Type: %s", msg.Type)
-				log.Printf("[IPC ERROR]   Payload: %s", string(msg.Payload))
+				logging.Error("Connection-level error received:")
+				logging.Error("  Type: %s", msg.Type)
+				logging.Error("  Payload: %s", string(msg.Payload))
 			}
 			select {
 			case c.incoming <- msg:
 			default:
-				fmt.Printf("[IPC DEBUG] Incoming channel full, dropping message\n")
+				logging.Debug("Incoming channel full, dropping message")
 			}
 		}
 	}
@@ -281,9 +282,9 @@ func (c *Connection) writeMessage(msg *Message) error {
 		return fmt.Errorf("failed to encode message: %w", err)
 	}
 
-	fmt.Printf("[IPC DEBUG] Writing %d bytes to socket\n", len(encoded))
+	logging.Debug("Writing %d bytes to socket", len(encoded))
 	if len(encoded) < 200 {
-		fmt.Printf("[IPC DEBUG] Wire bytes: % x\n", encoded)
+		logging.Debug("Wire bytes: % x", encoded)
 	}
 
 	if _, err := c.conn.Write(encoded); err != nil {
@@ -332,7 +333,7 @@ func (c *Connection) NewStream(operation string) *Stream {
 
 	c.activeStreams[streamID] = stream
 
-	fmt.Printf("[IPC DEBUG] Created stream %d for operation: %s\n", streamID, operation)
+	logging.Debug("Created stream %d for operation: %s", streamID, operation)
 
 	return stream
 }
@@ -380,8 +381,8 @@ func (c *Connection) handleResponseMessage(respMsg *Message) ([]byte, error) {
 	// Check for error response
 	if respMsg.Type == MessageTypeApplicationError {
 		err := c.parseErrorMessage(respMsg)
-		log.Printf("[IPC ERROR] Request-response operation failed: %v", err)
-		log.Printf("[IPC ERROR]   Payload: %s", string(respMsg.Payload))
+		logging.Error("Request-response operation failed: %v", err)
+		logging.Error("  Payload: %s", string(respMsg.Payload))
 		return nil, err
 	}
 
@@ -441,9 +442,9 @@ func (s *Stream) Activate(ctx context.Context, request interface{}) error {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	fmt.Printf("[IPC DEBUG] Activating stream %d:\n", s.id)
-	fmt.Printf("[IPC DEBUG]   Operation: %s\n", s.operation)
-	fmt.Printf("[IPC DEBUG]   Request payload: %s\n", string(payload))
+	logging.Debug("Activating stream %d:", s.id)
+	logging.Debug("  Operation: %s", s.operation)
+	logging.Debug("  Request payload: %s", string(payload))
 
 	// Create application message with stream ID
 	msg := CreateMessageWithStreamID(MessageTypeApplicationMessage, MessageFlagNone, s.id, payload)
@@ -455,7 +456,7 @@ func (s *Stream) Activate(ctx context.Context, request interface{}) error {
 	}
 
 	s.active = true
-	fmt.Printf("[IPC DEBUG] Stream %d activated successfully\n", s.id)
+	logging.Debug("Stream %d activated successfully", s.id)
 
 	return nil
 }
@@ -484,7 +485,7 @@ func (s *Stream) Close() error {
 		return nil
 	}
 
-	fmt.Printf("[IPC DEBUG] Closing stream %d (operation: %s)\n", s.id, s.operation)
+	logging.Debug("Closing stream %d (operation: %s)", s.id, s.operation)
 
 	// Only send TERMINATE if the stream wasn't already closed by readLoop
 	// If stream.closed is true, readLoop already closed the done channel due to connection error
@@ -492,14 +493,14 @@ func (s *Stream) Close() error {
 	if !s.closed {
 		msg := CreateMessageWithStreamID(MessageTypeApplicationMessage, MessageFlagTerminateStream, s.id, nil)
 		if err := s.conn.writeMessage(msg); err != nil {
-			log.Printf("[IPC ERROR] Failed to send TERMINATE for stream %d: %v", s.id, err)
+			logging.Error("Failed to send TERMINATE for stream %d: %v", s.id, err)
 		} else {
-			fmt.Printf("[IPC DEBUG] Sent TERMINATE for stream %d\n", s.id)
+			logging.Debug("Sent TERMINATE for stream %d", s.id)
 		}
 		close(s.done)
 		s.closed = true
 	} else {
-		fmt.Printf("[IPC DEBUG] Stream %d already closed by readLoop, skipping TERMINATE\n", s.id)
+		logging.Debug("Stream %d already closed by readLoop, skipping TERMINATE", s.id)
 	}
 
 	s.active = false
@@ -509,7 +510,7 @@ func (s *Stream) Close() error {
 	delete(s.conn.activeStreams, s.id)
 	s.conn.mu.Unlock()
 
-	fmt.Printf("[IPC DEBUG] Stream %d closed and removed from active streams\n", s.id)
+	logging.Debug("Stream %d closed and removed from active streams", s.id)
 
 	return nil
 }
