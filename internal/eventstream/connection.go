@@ -44,12 +44,13 @@ type Stream struct {
 	conn      *Connection
 	operation string
 
-	mu       sync.Mutex
-	active   bool
-	closed   bool // tracks if done channel has been closed
-	messages chan *Message
-	errors   chan error
-	done     chan struct{}
+	mu         sync.Mutex
+	active     bool
+	closed     bool // tracks if done channel has been closed
+	idAllocated bool // tracks if stream ID has been allocated (set in Activate)
+	messages   chan *Message
+	errors     chan error
+	done       chan struct{}
 }
 
 // Connect establishes a new EventStream RPC connection
@@ -315,25 +316,20 @@ func (c *Connection) Close() error {
 }
 
 // NewStream creates a new operation stream
+// Note: Stream ID is not allocated until Activate() is called, to ensure
+// atomic allocation + first message send and prevent stream-id ordering violations
 func (c *Connection) NewStream(operation string) *Stream {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	streamID := c.nextStreamID
-	c.nextStreamID++
-
 	stream := &Stream{
-		id:        streamID,
-		conn:      c,
-		operation: operation,
-		messages:  make(chan *Message, 10),
-		errors:    make(chan error, 1),
-		done:      make(chan struct{}),
+		id:          0, // Will be allocated in Activate()
+		conn:        c,
+		operation:   operation,
+		idAllocated: false,
+		messages:    make(chan *Message, 10),
+		errors:      make(chan error, 1),
+		done:        make(chan struct{}),
 	}
 
-	c.activeStreams[streamID] = stream
-
-	logging.Debug("Created stream %d for operation: %s", streamID, operation)
+	logging.Debug("Created stream for operation: %s (ID will be allocated on activation)", operation)
 
 	return stream
 }
@@ -442,6 +438,19 @@ func (s *Stream) Activate(ctx context.Context, request interface{}) error {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	// CRITICAL: Allocate stream ID and send first message atomically under connection lock
+	// This prevents race conditions where stream N+1 sends before stream N
+	s.conn.mu.Lock()
+
+	// Allocate stream ID if not already allocated
+	if !s.idAllocated {
+		s.id = s.conn.nextStreamID
+		s.conn.nextStreamID++
+		s.idAllocated = true
+		s.conn.activeStreams[s.id] = s
+		logging.Debug("Allocated stream ID %d for operation: %s", s.id, s.operation)
+	}
+
 	logging.Debug("Activating stream %d:", s.id)
 	logging.Debug("  Operation: %s", s.operation)
 	logging.Debug("  Request payload: %s", string(payload))
@@ -450,11 +459,9 @@ func (s *Stream) Activate(ctx context.Context, request interface{}) error {
 	msg := CreateMessageWithStreamID(MessageTypeApplicationMessage, MessageFlagNone, s.id, payload)
 	msg.SetHeader("operation", HeaderTypeString, s.operation)
 
-	// CRITICAL: Hold connection mutex during send to ensure stream-id monotonicity
-	// This prevents race where stream N+1 sends before stream N when multiple
-	// goroutines call NewStream() -> Activate() concurrently
-	s.conn.mu.Lock()
+	// Send request (still under connection lock for atomicity)
 	err = s.conn.writeMessage(msg)
+
 	s.conn.mu.Unlock()
 
 	if err != nil {
@@ -497,10 +504,10 @@ func (s *Stream) Close() error {
 	// We also remove from activeStreams in the same critical section for efficiency
 	s.conn.mu.Lock()
 
-	// Only send TERMINATE if the stream wasn't already closed by readLoop
-	// If stream.closed is true, readLoop already closed the done channel due to connection error
-	// In that case, don't send TERMINATE (connection may be dead or violates monotonic ordering)
-	if !s.closed {
+	// Only send TERMINATE if:
+	// 1. Stream ID was allocated (stream was activated)
+	// 2. Stream wasn't already closed by readLoop
+	if s.idAllocated && !s.closed {
 		msg := CreateMessageWithStreamID(MessageTypeApplicationMessage, MessageFlagTerminateStream, s.id, nil)
 		if err := s.conn.writeMessage(msg); err != nil {
 			logging.Error("Failed to send TERMINATE for stream %d: %v", s.id, err)
@@ -509,12 +516,20 @@ func (s *Stream) Close() error {
 		}
 		close(s.done)
 		s.closed = true
+	} else if !s.idAllocated {
+		logging.Debug("Stream not activated, skipping TERMINATE")
+		if !s.closed {
+			close(s.done)
+			s.closed = true
+		}
 	} else {
 		logging.Debug("Stream %d already closed by readLoop, skipping TERMINATE", s.id)
 	}
 
-	// Remove from active streams (in same critical section as TERMINATE send)
-	delete(s.conn.activeStreams, s.id)
+	// Remove from active streams only if ID was allocated
+	if s.idAllocated {
+		delete(s.conn.activeStreams, s.id)
+	}
 
 	s.conn.mu.Unlock()
 
