@@ -450,8 +450,14 @@ func (s *Stream) Activate(ctx context.Context, request interface{}) error {
 	msg := CreateMessageWithStreamID(MessageTypeApplicationMessage, MessageFlagNone, s.id, payload)
 	msg.SetHeader("operation", HeaderTypeString, s.operation)
 
-	// Send request
-	if err := s.conn.writeMessage(msg); err != nil {
+	// CRITICAL: Hold connection mutex during send to ensure stream-id monotonicity
+	// This prevents race where stream N+1 sends before stream N when multiple
+	// goroutines call NewStream() -> Activate() concurrently
+	s.conn.mu.Lock()
+	err = s.conn.writeMessage(msg)
+	s.conn.mu.Unlock()
+
+	if err != nil {
 		return fmt.Errorf("failed to send request: %w", err)
 	}
 
@@ -487,6 +493,10 @@ func (s *Stream) Close() error {
 
 	logging.Debug("Closing stream %d (operation: %s)", s.id, s.operation)
 
+	// CRITICAL: Hold connection mutex during TERMINATE send to ensure stream-id monotonicity
+	// We also remove from activeStreams in the same critical section for efficiency
+	s.conn.mu.Lock()
+
 	// Only send TERMINATE if the stream wasn't already closed by readLoop
 	// If stream.closed is true, readLoop already closed the done channel due to connection error
 	// In that case, don't send TERMINATE (connection may be dead or violates monotonic ordering)
@@ -503,12 +513,12 @@ func (s *Stream) Close() error {
 		logging.Debug("Stream %d already closed by readLoop, skipping TERMINATE", s.id)
 	}
 
-	s.active = false
-
-	// Remove from active streams
-	s.conn.mu.Lock()
+	// Remove from active streams (in same critical section as TERMINATE send)
 	delete(s.conn.activeStreams, s.id)
+
 	s.conn.mu.Unlock()
+
+	s.active = false
 
 	logging.Debug("Stream %d closed and removed from active streams", s.id)
 
