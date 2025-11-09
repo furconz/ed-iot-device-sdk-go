@@ -350,6 +350,7 @@ func TestCRCValidation(t *testing.T) {
 func TestCreateMessage(t *testing.T) {
 	msg := CreateMessage(MessageTypeApplicationMessage, MessageFlagTerminateStream, []byte("payload"))
 
+	// Verify Type, Flags, and Payload are set correctly
 	if msg.Type != MessageTypeApplicationMessage {
 		t.Errorf("Type mismatch: got %v, want %v", msg.Type, MessageTypeApplicationMessage)
 	}
@@ -360,21 +361,18 @@ func TestCreateMessage(t *testing.T) {
 		t.Errorf("Payload mismatch: got %v, want %v", msg.Payload, []byte("payload"))
 	}
 
-	// Check that :message-type and :message-flags headers are set
-	msgType, ok := msg.GetHeader(":message-type")
-	if !ok {
-		t.Error(":message-type header not found")
-	}
-	if msgType != int32(MessageTypeApplicationMessage) {
-		t.Errorf(":message-type mismatch: got %v, want %v", msgType, int32(MessageTypeApplicationMessage))
-	}
+	// Note: :message-type and :message-flags are NOT stored in the Headers slice.
+	// They are stored in Message.Type and Message.Flags fields and automatically
+	// added during encoding (see encodeHeaders). During decoding, they are extracted
+	// from headers back into the Type/Flags fields (see decodeHeaders).
 
-	msgFlags, ok := msg.GetHeader(":message-flags")
+	// Verify :stream-id header is set
+	streamID, ok := msg.GetHeader(":stream-id")
 	if !ok {
-		t.Error(":message-flags header not found")
+		t.Error(":stream-id header not found")
 	}
-	if msgFlags != int32(MessageFlagTerminateStream) {
-		t.Errorf(":message-flags mismatch: got %v, want %v", msgFlags, int32(MessageFlagTerminateStream))
+	if streamID != int32(0) {
+		t.Errorf(":stream-id mismatch: got %v, want 0", streamID)
 	}
 }
 
