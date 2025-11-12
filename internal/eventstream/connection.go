@@ -35,6 +35,10 @@ type Connection struct {
 	shouldReconnect  bool
 	reconnectTrigger chan struct{}
 
+	// For signaling connection ready state
+	reconnectedChan chan struct{} // Closed when connection is ready
+	reconnectedMu   sync.RWMutex  // Protects reconnectedChan
+
 	// For ping/keepalive
 	lastActivity time.Time
 	lastPingSent time.Time
@@ -86,6 +90,10 @@ type Stream struct {
 
 // Connect establishes a new EventStream RPC connection
 func Connect(ctx context.Context, config ConnectionConfig) (*Connection, error) {
+	// Create closed channel to signal connection is initially ready
+	readyChan := make(chan struct{})
+	close(readyChan)
+
 	c := &Connection{
 		config:           config,
 		nextStreamID:     1, // Stream ID 0 is reserved for connection-level messages
@@ -93,6 +101,7 @@ func Connect(ctx context.Context, config ConnectionConfig) (*Connection, error) 
 		incoming:         make(chan *Message, 100),
 		shouldReconnect:  config.EnableReconnection,
 		reconnectTrigger: make(chan struct{}, 1),
+		reconnectedChan:  readyChan,
 		lastActivity:     time.Now(),
 		lastPongRecv:     time.Now(),
 	}
@@ -145,6 +154,13 @@ func (c *Connection) connect(ctx context.Context) error {
 	c.lastActivity = time.Now()
 	c.lastPongRecv = time.Now()
 	c.pingMu.Unlock()
+
+	// Signal that connection is ready for use
+	c.reconnectedMu.Lock()
+	if c.reconnectedChan != nil {
+		close(c.reconnectedChan) // Wake up waiting operations
+	}
+	c.reconnectedMu.Unlock()
 
 	// Start message reader
 	go c.readLoop()
@@ -254,6 +270,27 @@ func (c *Connection) triggerReconnect(err error) {
 	case c.reconnectTrigger <- struct{}{}:
 	default:
 		// Already triggered, no need to send again
+	}
+}
+
+// WaitUntilReady blocks until the connection is ready for use
+// Returns nil when connection is ready, or context error if cancelled
+func (c *Connection) WaitUntilReady(ctx context.Context) error {
+	c.reconnectedMu.RLock()
+	ch := c.reconnectedChan
+	c.reconnectedMu.RUnlock()
+
+	if ch == nil {
+		// Channel not initialized, connection is ready
+		return nil
+	}
+
+	select {
+	case <-ch:
+		// Connection is ready
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -409,6 +446,12 @@ func (c *Connection) readLoop() {
 			c.readMu.Lock()
 			c.readErr = wrappedErr
 			c.readMu.Unlock()
+
+			// Create new reconnection signal BEFORE marking disconnected
+			// This ensures operations that check readiness will block until reconnection succeeds
+			c.reconnectedMu.Lock()
+			c.reconnectedChan = make(chan struct{}) // Open channel = not ready
+			c.reconnectedMu.Unlock()
 
 			// Mark connection as not connected
 			c.mu.Lock()
@@ -630,11 +673,19 @@ func (c *Connection) RequestResponse(ctx context.Context, operation string, requ
 
 		// Wait for connection to be ready if we're reconnecting
 		if attempt > 1 {
-			logging.Info("Request-response retry attempt %d/%d for operation %s", attempt, maxRetries, operation)
-			if !c.waitForConnection(ctx, 30*time.Second) {
-				logging.Error("Timeout waiting for reconnection on attempt %d", attempt)
+			logging.Info("Request-response retry attempt %d/%d for operation %s - waiting for connection...", attempt, maxRetries, operation)
+
+			// Use WaitUntilReady with a timeout
+			waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			err := c.WaitUntilReady(waitCtx)
+			cancel()
+
+			if err != nil {
+				logging.Error("Connection not ready for retry attempt %d: %v", attempt, err)
 				continue
 			}
+
+			logging.Debug("Connection ready for retry attempt %d", attempt)
 		}
 
 		result, err := c.requestResponseOnce(ctx, operation, request)
@@ -706,33 +757,6 @@ func (c *Connection) requestResponseOnce(ctx context.Context, operation string, 
 			return nil, fmt.Errorf("stream closed without response")
 		}
 		return c.handleResponseMessage(respMsg)
-	}
-}
-
-// waitForConnection waits for the connection to be re-established
-func (c *Connection) waitForConnection(ctx context.Context, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for {
-		c.mu.Lock()
-		connected := c.connected
-		c.mu.Unlock()
-
-		if connected {
-			return true
-		}
-
-		// Check if we've exceeded timeout
-		if time.Now().After(deadline) {
-			return false
-		}
-
-		// Check if context is cancelled
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(100 * time.Millisecond):
-			// Continue waiting
-		}
 	}
 }
 

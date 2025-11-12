@@ -165,13 +165,29 @@ func (s *Subscription[T]) resubscribe() bool {
 		default:
 		}
 
-		logging.Info("Resubscribe attempt %d/%d for operation %s", attempt, maxAttempts, s.operation)
+		logging.Info("Resubscribe attempt %d/%d for operation %s - waiting for connection...", attempt, maxAttempts, s.operation)
 
-		// Create new stream
+		// Wait for connection to be ready before attempting to resubscribe
+		// Use a timeout to avoid infinite wait
+		waitCtx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
+		err := s.client.conn.WaitUntilReady(waitCtx)
+		cancel()
+
+		if err != nil {
+			logging.Error("Resubscribe attempt %d: connection not ready: %v", attempt, err)
+			if attempt < maxAttempts {
+				time.Sleep(time.Second * time.Duration(attempt))
+			}
+			continue
+		}
+
+		logging.Info("Connection ready, creating new stream for resubscribe attempt %d", attempt)
+
+		// NOW it's safe to create stream
 		stream := s.client.conn.NewStream(s.operation)
 
 		// Attempt to activate with original request
-		err := stream.Activate(s.ctx, s.request)
+		err = stream.Activate(s.ctx, s.request)
 		if err == nil {
 			// Success! Replace the old stream
 			s.stream.Close() // Close old stream
