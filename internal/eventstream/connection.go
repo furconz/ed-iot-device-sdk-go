@@ -6,14 +6,15 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/furconz/ed-iot-device-sdk-go/internal/logging"
 )
 
 // Connection represents an EventStream RPC connection
 type Connection struct {
-	conn      net.Conn
-	authToken string
+	conn   net.Conn
+	config ConnectionConfig
 
 	mu            sync.Mutex
 	connected     bool
@@ -27,6 +28,18 @@ type Connection struct {
 
 	// For sending messages
 	writeMu sync.Mutex
+
+	// For reconnection
+	reconnectMu      sync.Mutex
+	reconnecting     bool
+	shouldReconnect  bool
+	reconnectTrigger chan struct{}
+
+	// For ping/keepalive
+	lastActivity time.Time
+	lastPingSent time.Time
+	lastPongRecv time.Time
+	pingMu       sync.Mutex
 }
 
 // ConnectionConfig holds configuration for establishing a connection
@@ -36,6 +49,24 @@ type ConnectionConfig struct {
 
 	// AuthToken is the authentication token for the connection
 	AuthToken string
+
+	// EnableReconnection enables automatic reconnection on connection failure
+	EnableReconnection bool
+
+	// PingInterval is how often to send keepalive pings
+	PingInterval time.Duration
+
+	// PingTimeout is how long to wait for ping response
+	PingTimeout time.Duration
+
+	// MaxRetries is max retry attempts for request-response operations
+	MaxRetries int
+
+	// OnDisconnected callback when connection is lost
+	OnDisconnected func(error)
+
+	// OnReconnected callback when connection is restored
+	OnReconnected func()
 }
 
 // Stream represents an EventStream RPC operation stream
@@ -55,42 +86,241 @@ type Stream struct {
 
 // Connect establishes a new EventStream RPC connection
 func Connect(ctx context.Context, config ConnectionConfig) (*Connection, error) {
-	logging.Info("Connecting to socket: %s", config.SocketPath)
+	c := &Connection{
+		config:           config,
+		nextStreamID:     1, // Stream ID 0 is reserved for connection-level messages
+		activeStreams:    make(map[uint32]*Stream),
+		incoming:         make(chan *Message, 100),
+		shouldReconnect:  config.EnableReconnection,
+		reconnectTrigger: make(chan struct{}, 1),
+		lastActivity:     time.Now(),
+		lastPongRecv:     time.Now(),
+	}
+
+	// Perform initial connection
+	if err := c.connect(ctx); err != nil {
+		return nil, err
+	}
+
+	// Start reconnection loop if enabled
+	if config.EnableReconnection {
+		go c.reconnectLoop(ctx)
+	}
+
+	return c, nil
+}
+
+// connect performs the actual socket connection and handshake
+func (c *Connection) connect(ctx context.Context) error {
+	logging.Info("Connecting to socket: %s", c.config.SocketPath)
+
 	// Connect to Unix domain socket
 	dialer := &net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "unix", config.SocketPath)
+	conn, err := dialer.DialContext(ctx, "unix", c.config.SocketPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to socket: %w", err)
+		return &ConnectionError{Err: fmt.Errorf("failed to connect to socket: %w", err)}
 	}
 	logging.Info("Socket connected successfully")
 
-	c := &Connection{
-		conn:          conn,
-		authToken:     config.AuthToken,
-		nextStreamID:  1, // Stream ID 0 is reserved for connection-level messages
-		activeStreams: make(map[uint32]*Stream),
-		incoming:      make(chan *Message, 100),
-	}
+	c.conn = conn
 
 	// Perform handshake
 	if err := c.handshake(ctx); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("handshake failed: %w", err)
+		return fmt.Errorf("handshake failed: %w", err)
 	}
 
+	c.mu.Lock()
 	c.connected = true
+	c.nextStreamID = 1
+	c.activeStreams = make(map[uint32]*Stream)
+	c.mu.Unlock()
+
+	c.readMu.Lock()
+	c.readErr = nil
+	c.incoming = make(chan *Message, 100)
+	c.readMu.Unlock()
+
+	c.pingMu.Lock()
+	c.lastActivity = time.Now()
+	c.lastPongRecv = time.Now()
+	c.pingMu.Unlock()
 
 	// Start message reader
 	go c.readLoop()
 
-	return c, nil
+	// Start ping loop if keepalive enabled
+	if c.config.PingInterval > 0 {
+		go c.pingLoop()
+	}
+
+	logging.Info("Connection established successfully")
+
+	return nil
+}
+
+// reconnectLoop handles automatic reconnection with exponential backoff
+func (c *Connection) reconnectLoop(ctx context.Context) {
+	logging.Debug("Reconnection loop started")
+	for {
+		// Wait for reconnection trigger
+		select {
+		case <-ctx.Done():
+			logging.Debug("Reconnection loop exiting due to context cancellation")
+			return
+		case <-c.reconnectTrigger:
+			// Connection lost, attempt reconnection
+		}
+
+		c.reconnectMu.Lock()
+		if !c.shouldReconnect {
+			c.reconnectMu.Unlock()
+			logging.Debug("Reconnection disabled, exiting reconnect loop")
+			return
+		}
+		c.reconnecting = true
+		c.reconnectMu.Unlock()
+
+		logging.Info("Starting reconnection attempts...")
+
+		// Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (max)
+		delay := 1 * time.Second
+		maxDelay := 30 * time.Second
+		attempt := 1
+
+		for {
+			select {
+			case <-ctx.Done():
+				c.reconnectMu.Lock()
+				c.reconnecting = false
+				c.reconnectMu.Unlock()
+				return
+			default:
+			}
+
+			logging.Info("Reconnection attempt %d (waiting %v)...", attempt, delay)
+			time.Sleep(delay)
+
+			// Attempt to reconnect
+			err := c.connect(ctx)
+			if err == nil {
+				// Successfully reconnected
+				logging.Info("Reconnection successful after %d attempts", attempt)
+
+				c.reconnectMu.Lock()
+				c.reconnecting = false
+				c.reconnectMu.Unlock()
+
+				// Call reconnected callback
+				if c.config.OnReconnected != nil {
+					go c.config.OnReconnected()
+				}
+
+				break // Exit retry loop, wait for next trigger
+			}
+
+			logging.Error("Reconnection attempt %d failed: %v", attempt, err)
+
+			// Increase delay with exponential backoff
+			delay = delay * 2
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+			attempt++
+		}
+	}
+}
+
+// triggerReconnect signals the reconnection loop to start reconnecting
+func (c *Connection) triggerReconnect(err error) {
+	c.reconnectMu.Lock()
+	shouldTrigger := c.shouldReconnect && !c.reconnecting
+	c.reconnectMu.Unlock()
+
+	if !shouldTrigger {
+		logging.Debug("Reconnection not triggered (disabled or already reconnecting)")
+		return
+	}
+
+	logging.Info("Triggering reconnection due to: %v", err)
+
+	// Call disconnected callback
+	if c.config.OnDisconnected != nil {
+		go c.config.OnDisconnected(err)
+	}
+
+	// Non-blocking trigger
+	select {
+	case c.reconnectTrigger <- struct{}{}:
+	default:
+		// Already triggered, no need to send again
+	}
+}
+
+// pingLoop sends periodic keepalive pings and checks for stale connections
+func (c *Connection) pingLoop() {
+	logging.Debug("Ping loop started (interval: %v, timeout: %v)", c.config.PingInterval, c.config.PingTimeout)
+
+	ticker := time.NewTicker(c.config.PingInterval)
+	defer ticker.Stop()
+
+	for {
+		<-ticker.C
+
+		// Check if connection is still active
+		c.mu.Lock()
+		connected := c.connected
+		c.mu.Unlock()
+
+		if !connected {
+			logging.Debug("Ping loop exiting: connection not active")
+			return
+		}
+
+		c.pingMu.Lock()
+		timeSinceActivity := time.Since(c.lastActivity)
+		timeSincePong := time.Since(c.lastPongRecv)
+		c.pingMu.Unlock()
+
+		// Only send ping if we've been idle
+		if timeSinceActivity < c.config.PingInterval {
+			logging.Debug("Skipping ping: recent activity (%v ago)", timeSinceActivity)
+			continue
+		}
+
+		// Check if last ping timed out
+		if timeSincePong > c.config.PingInterval+c.config.PingTimeout {
+			logging.Error("Ping timeout: no pong received for %v (threshold: %v)", timeSincePong, c.config.PingInterval+c.config.PingTimeout)
+			// Close connection to trigger reconnection
+			if c.conn != nil {
+				c.conn.Close()
+			}
+			return
+		}
+
+		// Send ping
+		logging.Debug("Sending keepalive ping...")
+		pingMsg := CreateMessage(MessageTypePing, MessageFlagNone, nil)
+
+		c.pingMu.Lock()
+		c.lastPingSent = time.Now()
+		c.pingMu.Unlock()
+
+		if err := c.writeMessage(pingMsg); err != nil {
+			logging.Error("Failed to send ping: %v", err)
+			// Write error will be caught by readLoop or next operation
+			return
+		}
+
+		logging.Debug("Keepalive ping sent")
+	}
 }
 
 // handshake performs the CONNECT/CONNACK handshake
 func (c *Connection) handshake(ctx context.Context) error {
 	// Create CONNECT message
 	connectReq := ConnectRequest{
-		AuthToken: c.authToken,
+		AuthToken: c.config.AuthToken,
 	}
 	payload, err := json.Marshal(connectReq)
 	if err != nil {
@@ -172,15 +402,22 @@ func (c *Connection) readLoop() {
 		msg, err := DecodeMessage(c.conn)
 		if err != nil {
 			logging.Error("DecodeMessage error: %v", err)
+
+			// Wrap as connection error if it's a network error
+			wrappedErr := WrapIfConnectionError(err)
+
 			c.readMu.Lock()
-			c.readErr = err
+			c.readErr = wrappedErr
 			c.readMu.Unlock()
 
-			// Close all active streams
+			// Mark connection as not connected
 			c.mu.Lock()
+			c.connected = false
+
+			// Close all active streams
 			for _, stream := range c.activeStreams {
 				select {
-				case stream.errors <- err:
+				case stream.errors <- wrappedErr:
 				default:
 				}
 				stream.mu.Lock()
@@ -193,8 +430,19 @@ func (c *Connection) readLoop() {
 			c.mu.Unlock()
 
 			close(c.incoming)
+
+			// Trigger reconnection if enabled and it's a connection error
+			if IsConnectionError(wrappedErr) {
+				c.triggerReconnect(wrappedErr)
+			}
+
 			return
 		}
+
+		// Update last activity time
+		c.pingMu.Lock()
+		c.lastActivity = time.Now()
+		c.pingMu.Unlock()
 
 		// Log EVERY message received before any processing
 		logging.Debug("Raw message received: type=%s flags=%s payloadLen=%d headerCount=%d",
@@ -212,6 +460,26 @@ func (c *Connection) readLoop() {
 
 		logging.Debug("Received message for stream %d: type=%s flags=%s",
 			streamID, msg.Type, msg.Flags)
+
+		// Handle ping/pong messages
+		if msg.Type == MessageTypePing {
+			logging.Debug("Received ping, sending pong...")
+			pongMsg := CreateMessage(MessageTypePingResponse, MessageFlagNone, nil)
+			if err := c.writeMessage(pongMsg); err != nil {
+				logging.Error("Failed to send pong: %v", err)
+			} else {
+				logging.Debug("Pong sent")
+			}
+			continue
+		}
+
+		if msg.Type == MessageTypePingResponse {
+			c.pingMu.Lock()
+			c.lastPongRecv = time.Now()
+			c.pingMu.Unlock()
+			logging.Debug("Received pong")
+			continue
+		}
 
 		// Route message to appropriate stream
 		c.mu.Lock()
@@ -289,8 +557,18 @@ func (c *Connection) writeMessage(msg *Message) error {
 	}
 
 	if _, err := c.conn.Write(encoded); err != nil {
-		return fmt.Errorf("failed to write message: %w", err)
+		wrappedErr := WrapIfConnectionError(err)
+		// Trigger reconnection if it's a connection error
+		if IsConnectionError(wrappedErr) {
+			c.triggerReconnect(wrappedErr)
+		}
+		return fmt.Errorf("failed to write message: %w", wrappedErr)
 	}
+
+	// Update last activity time on successful write
+	c.pingMu.Lock()
+	c.lastActivity = time.Now()
+	c.pingMu.Unlock()
 
 	return nil
 }
@@ -334,8 +612,66 @@ func (c *Connection) NewStream(operation string) *Stream {
 	return stream
 }
 
-// RequestResponse performs a simple request-response operation
+// RequestResponse performs a simple request-response operation with automatic retry on connection failure
 func (c *Connection) RequestResponse(ctx context.Context, operation string, request interface{}) ([]byte, error) {
+	maxRetries := c.config.MaxRetries
+	if maxRetries == 0 {
+		maxRetries = 1 // At least one attempt
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Check if context is cancelled
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		// Wait for connection to be ready if we're reconnecting
+		if attempt > 1 {
+			logging.Info("Request-response retry attempt %d/%d for operation %s", attempt, maxRetries, operation)
+			if !c.waitForConnection(ctx, 30*time.Second) {
+				logging.Error("Timeout waiting for reconnection on attempt %d", attempt)
+				continue
+			}
+		}
+
+		result, err := c.requestResponseOnce(ctx, operation, request)
+		if err == nil {
+			if attempt > 1 {
+				logging.Info("Request-response succeeded on retry attempt %d", attempt)
+			}
+			return result, nil
+		}
+
+		lastErr = err
+
+		// Only retry on connection errors
+		if !IsConnectionError(err) {
+			logging.Debug("Not retrying non-connection error: %v", err)
+			return nil, err
+		}
+
+		logging.Error("Request-response attempt %d failed with connection error: %v", attempt, err)
+
+		// Don't sleep after last attempt
+		if attempt < maxRetries {
+			// Wait a bit before retrying
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Second):
+				// Short delay between retries
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("request-response failed after %d attempts: %w", maxRetries, lastErr)
+}
+
+// requestResponseOnce performs a single request-response operation without retrylogic
+func (c *Connection) requestResponseOnce(ctx context.Context, operation string, request interface{}) ([]byte, error) {
 	// Create a new stream for this request-response operation
 	stream := c.NewStream(operation)
 
@@ -370,6 +706,33 @@ func (c *Connection) RequestResponse(ctx context.Context, operation string, requ
 			return nil, fmt.Errorf("stream closed without response")
 		}
 		return c.handleResponseMessage(respMsg)
+	}
+}
+
+// waitForConnection waits for the connection to be re-established
+func (c *Connection) waitForConnection(ctx context.Context, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		c.mu.Lock()
+		connected := c.connected
+		c.mu.Unlock()
+
+		if connected {
+			return true
+		}
+
+		// Check if we've exceeded timeout
+		if time.Now().After(deadline) {
+			return false
+		}
+
+		// Check if context is cancelled
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(100 * time.Millisecond):
+			// Continue waiting
+		}
 	}
 }
 

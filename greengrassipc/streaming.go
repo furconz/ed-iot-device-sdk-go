@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/furconz/ed-iot-device-sdk-go/internal/eventstream"
 	"github.com/furconz/ed-iot-device-sdk-go/internal/logging"
@@ -14,13 +15,18 @@ import (
 // Subscriptions receive messages asynchronously via channels.
 // Use the Messages(), Errors(), and Done() methods to receive events.
 // Always call Close() when done to clean up resources.
+//
+// Subscriptions automatically resubscribe on connection failure if reconnection is enabled.
 type Subscription[T any] struct {
-	stream   *eventstream.Stream
-	messages chan T
-	errors   chan error
-	done     chan struct{}
-	ctx      context.Context
-	cancel   context.CancelFunc
+	stream    *eventstream.Stream
+	messages  chan T
+	errors    chan error
+	done      chan struct{}
+	ctx       context.Context
+	cancel    context.CancelFunc
+	client    *Client
+	operation string
+	request   interface{}
 }
 
 // Messages returns a channel that receives subscription messages
@@ -45,15 +51,18 @@ func (s *Subscription[T]) Close() error {
 }
 
 // newSubscription creates a new subscription
-func newSubscription[T any](ctx context.Context, stream *eventstream.Stream) *Subscription[T] {
+func newSubscription[T any](ctx context.Context, client *Client, operation string, request interface{}, stream *eventstream.Stream) *Subscription[T] {
 	subCtx, cancel := context.WithCancel(ctx)
 	sub := &Subscription[T]{
-		stream:   stream,
-		messages: make(chan T, 10),
-		errors:   make(chan error, 1),
-		done:     make(chan struct{}),
-		ctx:      subCtx,
-		cancel:   cancel,
+		stream:    stream,
+		messages:  make(chan T, 10),
+		errors:    make(chan error, 1),
+		done:      make(chan struct{}),
+		ctx:       subCtx,
+		cancel:    cancel,
+		client:    client,
+		operation: operation,
+		request:   request,
 	}
 
 	// Start message processing goroutine
@@ -70,9 +79,36 @@ func (s *Subscription[T]) processMessages() {
 	for {
 		select {
 		case <-s.ctx.Done():
+			logging.Debug("Subscription context cancelled")
 			return
 
 		case err := <-s.stream.Errors():
+			if err == nil {
+				// Channel closed, stream ended
+				logging.Debug("Subscription stream errors channel closed")
+				return
+			}
+
+			// Check if it's a connection error that should trigger resubscribe
+			if eventstream.IsConnectionError(err) {
+				logging.Info("Subscription detected connection error, attempting to resubscribe: %v", err)
+
+				// Attempt to resubscribe
+				if s.resubscribe() {
+					logging.Info("Subscription resubscribed successfully, resuming message processing")
+					continue
+				}
+
+				// Resubscribe failed, report error and exit
+				logging.Error("Subscription resubscribe failed")
+				select {
+				case s.errors <- err:
+				case <-s.ctx.Done():
+				}
+				return
+			}
+
+			// Not a connection error, report it
 			select {
 			case s.errors <- err:
 			case <-s.ctx.Done():
@@ -80,6 +116,7 @@ func (s *Subscription[T]) processMessages() {
 			}
 
 		case <-s.stream.Done():
+			logging.Debug("Subscription stream done")
 			return
 
 		case msg := <-s.stream.Messages():
@@ -118,6 +155,52 @@ func (s *Subscription[T]) processMessages() {
 	}
 }
 
+// resubscribe attempts to resubscribe after a connection failure
+func (s *Subscription[T]) resubscribe() bool {
+	maxAttempts := 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		select {
+		case <-s.ctx.Done():
+			return false
+		default:
+		}
+
+		logging.Info("Resubscribe attempt %d/%d for operation %s", attempt, maxAttempts, s.operation)
+
+		// Create new stream
+		stream := s.client.conn.NewStream(s.operation)
+
+		// Attempt to activate with original request
+		err := stream.Activate(s.ctx, s.request)
+		if err == nil {
+			// Success! Replace the old stream
+			s.stream.Close() // Close old stream
+			s.stream = stream
+			logging.Info("Successfully resubscribed on attempt %d", attempt)
+			return true
+		}
+
+		logging.Error("Resubscribe attempt %d failed: %v", attempt, err)
+
+		// Don't retry on non-connection errors
+		if !eventstream.IsConnectionError(err) {
+			return false
+		}
+
+		// Wait before retrying (unless it's the last attempt)
+		if attempt < maxAttempts {
+			select {
+			case <-s.ctx.Done():
+				return false
+			case <-time.After(time.Second * time.Duration(attempt)):
+				// Exponential backoff: 1s, 2s, 3s
+			}
+		}
+	}
+
+	return false
+}
+
 // SubscribeToIoTCore subscribes to messages from AWS IoT Core
 //
 // Creates a subscription to receive messages published to the specified
@@ -151,7 +234,7 @@ func (c *Client) SubscribeToIoTCore(ctx context.Context, req *SubscribeToIoTCore
 		return nil, fmt.Errorf("failed to activate subscription: %w", err)
 	}
 
-	return newSubscription[IoTCoreMessage](ctx, stream), nil
+	return newSubscription[IoTCoreMessage](ctx, c, opSubscribeToIoTCore, req, stream), nil
 }
 
 // SubscribeToTopic subscribes to messages from a local Greengrass topic
@@ -181,7 +264,7 @@ func (c *Client) SubscribeToTopic(ctx context.Context, req *SubscribeToTopicRequ
 		return nil, fmt.Errorf("failed to activate subscription: %w", err)
 	}
 
-	return newSubscription[SubscriptionResponseMessage](ctx, stream), nil
+	return newSubscription[SubscriptionResponseMessage](ctx, c, opSubscribeToTopic, req, stream), nil
 }
 
 // SubscribeToComponentUpdates subscribes to component update notifications
@@ -194,7 +277,7 @@ func (c *Client) SubscribeToComponentUpdates(ctx context.Context, req *Subscribe
 		return nil, fmt.Errorf("failed to activate subscription: %w", err)
 	}
 
-	return newSubscription[ComponentUpdatePolicyEvents](ctx, stream), nil
+	return newSubscription[ComponentUpdatePolicyEvents](ctx, c, opSubscribeToComponentUpdates, req, stream), nil
 }
 
 // SubscribeToConfigurationUpdate subscribes to configuration changes
@@ -206,7 +289,7 @@ func (c *Client) SubscribeToConfigurationUpdate(ctx context.Context, req *Subscr
 		return nil, fmt.Errorf("failed to activate subscription: %w", err)
 	}
 
-	return newSubscription[ConfigurationUpdateEvents](ctx, stream), nil
+	return newSubscription[ConfigurationUpdateEvents](ctx, c, opSubscribeToConfigurationUpdate, req, stream), nil
 }
 
 // SubscribeToValidateConfigurationUpdates subscribes to configuration validation requests
@@ -220,7 +303,7 @@ func (c *Client) SubscribeToValidateConfigurationUpdates(ctx context.Context, re
 		return nil, fmt.Errorf("failed to activate subscription: %w", err)
 	}
 
-	return newSubscription[ValidateConfigurationUpdateEvents](ctx, stream), nil
+	return newSubscription[ValidateConfigurationUpdateEvents](ctx, c, opSubscribeToValidateConfigurationUpdates, req, stream), nil
 }
 
 // SubscribeToCertificateUpdates subscribes to certificate update notifications
@@ -232,5 +315,5 @@ func (c *Client) SubscribeToCertificateUpdates(ctx context.Context, req *Subscri
 		return nil, fmt.Errorf("failed to activate subscription: %w", err)
 	}
 
-	return newSubscription[CertificateUpdateEvent](ctx, stream), nil
+	return newSubscription[CertificateUpdateEvent](ctx, c, opSubscribeToCertificateUpdates, req, stream), nil
 }

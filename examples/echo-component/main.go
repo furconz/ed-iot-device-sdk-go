@@ -76,8 +76,19 @@ func main() {
 func NewComponent() (*Component, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Create IPC client (auto-detects from environment)
-	client, err := greengrassipc.NewClient(ctx, nil)
+	// Create IPC client with reconnection callbacks
+	client, err := greengrassipc.NewClient(ctx, &greengrassipc.ClientConfig{
+		Reconnection: &greengrassipc.ReconnectionConfig{
+			Enabled: true,
+			OnDisconnected: func(err error) {
+				log.Printf("⚠️  IPC connection lost: %v", err)
+				log.Println("⏳ Attempting to reconnect...")
+			},
+			OnReconnected: func() {
+				log.Println("✅ IPC connection restored successfully")
+			},
+		},
+	})
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("failed to create IPC client: %w", err)

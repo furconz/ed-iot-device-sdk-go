@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/furconz/ed-iot-device-sdk-go/internal/eventstream"
 	"github.com/furconz/ed-iot-device-sdk-go/internal/logging"
@@ -24,6 +25,35 @@ type ClientConfig struct {
 	// AuthToken is the authentication token for IPC
 	// If empty, will be read from SVCUID env var
 	AuthToken string
+
+	// Reconnection holds reconnection configuration
+	// If nil, default reconnection settings are used
+	Reconnection *ReconnectionConfig
+}
+
+// ReconnectionConfig holds configuration for automatic reconnection
+type ReconnectionConfig struct {
+	// Enabled controls whether automatic reconnection is enabled
+	// Default: true
+	Enabled bool
+
+	// PingInterval is how often to send keepalive pings
+	// Default: 30 seconds
+	PingInterval time.Duration
+
+	// PingTimeout is how long to wait for ping response before considering connection stale
+	// Default: 10 seconds
+	PingTimeout time.Duration
+
+	// MaxRetries is the maximum number of retry attempts for request-response operations
+	// Default: 3
+	MaxRetries int
+
+	// OnDisconnected is called when connection is lost (before reconnection attempts)
+	OnDisconnected func(err error)
+
+	// OnReconnected is called when connection is successfully re-established
+	OnReconnected func()
 }
 
 // NewClient creates a new Greengrass IPC client
@@ -56,10 +86,35 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 		logging.Info("Using auth token from env (length=%d)", len(cfg.AuthToken))
 	}
 
+	// Apply default reconnection settings if not provided
+	reconnectCfg := cfg.Reconnection
+	if reconnectCfg == nil {
+		reconnectCfg = &ReconnectionConfig{}
+	}
+	if reconnectCfg.PingInterval == 0 {
+		reconnectCfg.PingInterval = 30 * time.Second
+	}
+	if reconnectCfg.PingTimeout == 0 {
+		reconnectCfg.PingTimeout = 10 * time.Second
+	}
+	if reconnectCfg.MaxRetries == 0 {
+		reconnectCfg.MaxRetries = 3
+	}
+	// Default to enabled unless explicitly disabled
+	if cfg.Reconnection == nil {
+		reconnectCfg.Enabled = true
+	}
+
 	// Connect to IPC
 	conn, err := eventstream.Connect(ctx, eventstream.ConnectionConfig{
-		SocketPath: cfg.SocketPath,
-		AuthToken:  cfg.AuthToken,
+		SocketPath:         cfg.SocketPath,
+		AuthToken:          cfg.AuthToken,
+		EnableReconnection: reconnectCfg.Enabled,
+		PingInterval:       reconnectCfg.PingInterval,
+		PingTimeout:        reconnectCfg.PingTimeout,
+		MaxRetries:         reconnectCfg.MaxRetries,
+		OnDisconnected:     reconnectCfg.OnDisconnected,
+		OnReconnected:      reconnectCfg.OnReconnected,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Greengrass IPC: %w", err)
