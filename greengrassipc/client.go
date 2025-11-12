@@ -37,12 +37,19 @@ type ReconnectionConfig struct {
 	// Default: true
 	Enabled bool
 
+	// DisablePingPong disables proactive keepalive pings
+	// When disabled, connection failures are only detected when operations fail
+	// Default: false (pings are enabled)
+	DisablePingPong bool
+
 	// PingInterval is how often to send keepalive pings
 	// Default: 30 seconds
+	// Ignored if DisablePingPong is true
 	PingInterval time.Duration
 
 	// PingTimeout is how long to wait for ping response before considering connection stale
 	// Default: 10 seconds
+	// Ignored if DisablePingPong is true
 	PingTimeout time.Duration
 
 	// MaxRetries is the maximum number of retry attempts for request-response operations
@@ -110,6 +117,7 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 		SocketPath:         cfg.SocketPath,
 		AuthToken:          cfg.AuthToken,
 		EnableReconnection: reconnectCfg.Enabled,
+		DisablePingPong:    reconnectCfg.DisablePingPong,
 		PingInterval:       reconnectCfg.PingInterval,
 		PingTimeout:        reconnectCfg.PingTimeout,
 		MaxRetries:         reconnectCfg.MaxRetries,

@@ -57,6 +57,9 @@ type ConnectionConfig struct {
 	// EnableReconnection enables automatic reconnection on connection failure
 	EnableReconnection bool
 
+	// DisablePingPong disables proactive keepalive pings
+	DisablePingPong bool
+
 	// PingInterval is how often to send keepalive pings
 	PingInterval time.Duration
 
@@ -171,9 +174,12 @@ func (c *Connection) connect(ctx context.Context) error {
 	// Start message reader
 	go c.readLoop()
 
-	// Start ping loop if keepalive enabled
-	if c.config.PingInterval > 0 {
+	// Start ping loop if keepalive enabled and not disabled
+	if c.config.PingInterval > 0 && !c.config.DisablePingPong {
 		go c.pingLoop()
+		logging.Debug("Ping loop enabled (interval: %v, timeout: %v)", c.config.PingInterval, c.config.PingTimeout)
+	} else if c.config.DisablePingPong {
+		logging.Debug("Ping loop disabled by configuration")
 	}
 
 	logging.Info("Connection established successfully")
@@ -322,7 +328,8 @@ func (c *Connection) pingLoop() {
 
 		c.pingMu.Lock()
 		timeSinceActivity := time.Since(c.lastActivity)
-		timeSincePong := time.Since(c.lastPongRecv)
+		lastPingSent := c.lastPingSent
+		lastPongRecv := c.lastPongRecv
 		c.pingMu.Unlock()
 
 		// Only send ping if we've been idle
@@ -331,17 +338,27 @@ func (c *Connection) pingLoop() {
 			continue
 		}
 
-		// Check if last ping timed out
-		if timeSincePong > c.config.PingInterval+c.config.PingTimeout {
-			logging.Error("Ping timeout: no pong received for %v (threshold: %v)", timeSincePong, c.config.PingInterval+c.config.PingTimeout)
-			// Close connection to trigger reconnection
-			if c.conn != nil {
-				c.conn.Close()
+		// Check if we have an outstanding ping that timed out
+		if !lastPingSent.IsZero() && lastPingSent.After(lastPongRecv) {
+			// We sent a ping but haven't received pong yet
+			timeSincePing := time.Since(lastPingSent)
+
+			if timeSincePing > c.config.PingTimeout {
+				logging.Error("Ping timeout: no pong received for %v after sending ping (timeout: %v)",
+					timeSincePing, c.config.PingTimeout)
+				// Close connection to trigger reconnection
+				if c.conn != nil {
+					c.conn.Close()
+				}
+				return
 			}
-			return
+
+			// Ping still pending, don't send another yet
+			logging.Debug("Ping already outstanding for %v, waiting for pong", timeSincePing)
+			continue
 		}
 
-		// Send ping
+		// Send new ping
 		logging.Debug("Sending keepalive ping...")
 		pingMsg := CreateMessage(MessageTypePing, MessageFlagNone, nil)
 
