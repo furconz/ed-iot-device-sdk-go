@@ -90,9 +90,8 @@ type Stream struct {
 
 // Connect establishes a new EventStream RPC connection
 func Connect(ctx context.Context, config ConnectionConfig) (*Connection, error) {
-	// Create closed channel to signal connection is initially ready
+	// Create open channel - will be closed in connect() when ready
 	readyChan := make(chan struct{})
-	close(readyChan)
 
 	c := &Connection{
 		config:           config,
@@ -158,7 +157,14 @@ func (c *Connection) connect(ctx context.Context) error {
 	// Signal that connection is ready for use
 	c.reconnectedMu.Lock()
 	if c.reconnectedChan != nil {
-		close(c.reconnectedChan) // Wake up waiting operations
+		select {
+		case <-c.reconnectedChan:
+			// Already closed, skip
+			logging.Debug("Connection ready channel already closed")
+		default:
+			// Channel is open, safe to close
+			close(c.reconnectedChan)
+		}
 	}
 	c.reconnectedMu.Unlock()
 
