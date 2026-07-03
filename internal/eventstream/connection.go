@@ -5,11 +5,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/furconz/ed-iot-device-sdk-go/internal/logging"
 )
+
+// exitFunc is a package-level variable so tests can swap it without calling os.Exit.
+var exitFunc = os.Exit
+
+// nowFunc is a package-level variable so tests can inject a controllable clock.
+var nowFunc = time.Now
+
+// dropWindow is the sliding window duration for counting stream-level message drops.
+const dropWindow = 30 * time.Second
+
+// dropThreshold is the number of drops within dropWindow that triggers a self-restart.
+const dropThreshold = 10
 
 // Connection represents an EventStream RPC connection
 type Connection struct {
@@ -44,6 +57,11 @@ type Connection struct {
 	lastPingSent time.Time
 	lastPongRecv time.Time
 	pingMu       sync.Mutex
+
+	// droppedAt records the timestamps of stream-level message drops (stream.messages full).
+	// Touched only by the single readLoop goroutine — no mutex required.
+	// Survives reconnect because it is a field on *Connection, not on *Stream.
+	droppedAt []time.Time
 }
 
 // ConnectionConfig holds configuration for establishing a connection
@@ -577,6 +595,7 @@ func (c *Connection) readLoop() {
 					logging.Info("Stream %d already closed, dropping message", streamID)
 				default:
 					logging.Error("Stream %d message channel full, dropping message", streamID)
+					c.recordStreamDrop()
 				}
 			}
 
@@ -948,4 +967,35 @@ func (s *Stream) Close() error {
 	logging.Debug("Stream %d closed and removed from active streams", s.id)
 
 	return nil
+}
+
+// recordStreamDrop records a stream-level message drop (stream.messages channel full)
+// and triggers a self-restart via exitFunc(1) if dropThreshold drops occur within dropWindow.
+//
+// Must only be called from the readLoop goroutine — no mutex is needed because droppedAt
+// is a field on *Connection (survives reconnect) and is accessed from a single goroutine.
+func (c *Connection) recordStreamDrop() {
+	now := nowFunc()
+	c.droppedAt = append(c.droppedAt, now)
+
+	// Evict entries that have aged out of the sliding window.
+	cutoff := now.Add(-dropWindow)
+	i := 0
+	for i < len(c.droppedAt) && c.droppedAt[i].Before(cutoff) {
+		i++
+	}
+	c.droppedAt = c.droppedAt[i:]
+
+	if len(c.droppedAt) >= dropThreshold {
+		logging.Error(
+			"eventstream: %d inbound messages dropped within %s — consumer stalled; exiting to trigger Greengrass restart",
+			len(c.droppedAt),
+			dropWindow,
+		)
+		// Flush stderr so the log line reaches Greengrass LogManager before the process dies.
+		// os.Stderr.Sync() returns EINVAL on a TTY in local dev but succeeds under Greengrass's
+		// pipe to LogManager; ignore the return value in both cases.
+		os.Stderr.Sync() //nolint:errcheck
+		exitFunc(1)
+	}
 }
