@@ -45,18 +45,18 @@ func (g *generationGuard) once(gen uint64, fn func() bool) bool {
 //
 // Subscriptions automatically resubscribe on connection failure if reconnection is enabled.
 type Subscription[T any] struct {
-	stream    *eventstream.Stream
-	messages  chan T
-	errors    chan error
-	done      chan struct{}
-	ctx       context.Context
-	cancel    context.CancelFunc
-	client    *Client
-	operation string
-	request   interface{}
-	label      string           // caller-supplied label for log disambiguation (may be empty)
-	topic      string           // MQTT topic name captured at creation time (SubscribeToIoTCore only)
-	resubGuard generationGuard  // ensures resubscription fires exactly once per connection generation
+	stream     *eventstream.Stream
+	messages   chan T
+	errors     chan error
+	done       chan struct{}
+	ctx        context.Context
+	cancel     context.CancelFunc
+	client     *Client
+	operation  string
+	request    interface{}
+	label      string          // caller-supplied label for log disambiguation (may be empty)
+	topic      string          // MQTT topic name captured at creation time (SubscribeToIoTCore only)
+	resubGuard generationGuard // ensures resubscription fires exactly once per connection generation
 }
 
 // Messages returns a channel that receives subscription messages
