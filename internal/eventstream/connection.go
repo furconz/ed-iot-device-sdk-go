@@ -55,12 +55,24 @@ func (c *Connection) markConnected() {
 // noteClosedID records that we cleanly closed stream id — used to discriminate QoS1
 // redeliveries (a duplicate for a recently-closed id) from genuine routing-miss orphans.
 // Must be called ONLY for ids we actually owned and closed (inside Close's ownership block).
+//
+// Opportunistically sweeps expired entries (older than closedIDTTL) while healthMu is
+// already held, so the map cannot grow without bound on a long-lived connection where
+// requestResponseOnce creates+closes a fresh stream per publish/config op.
 func (c *Connection) noteClosedID(id uint32) {
+	now := nowFunc()
 	c.healthMu.Lock()
 	if c.recentlyClosed == nil {
 		c.recentlyClosed = make(map[uint32]time.Time)
 	}
-	c.recentlyClosed[id] = nowFunc()
+	c.recentlyClosed[id] = now
+	// Sweep entries that have aged out of the TTL window. Deleting during range is safe
+	// in Go; the newly-added entry has age 0 so it is never self-pruned here.
+	for rid, t := range c.recentlyClosed {
+		if now.Sub(t) >= closedIDTTL {
+			delete(c.recentlyClosed, rid)
+		}
+	}
 	c.healthMu.Unlock()
 }
 
@@ -87,6 +99,10 @@ func (c *Connection) recordRoutingMiss(id uint32) {
 	signal := false
 	if now.Sub(c.connectedAt) >= startupGrace {
 		if t, ok := c.recentlyClosed[id]; !ok || now.Sub(t) >= closedIDTTL {
+			if ok {
+				// Expired entry — prune it while healthMu is held.
+				delete(c.recentlyClosed, id)
+			}
 			c.orphanAt = append(c.orphanAt, now)
 			cutoff := now.Add(-orphanWindow)
 			i := 0

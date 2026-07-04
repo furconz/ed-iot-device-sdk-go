@@ -69,6 +69,61 @@ func TestHealth_ReconnectFlapSignals(t *testing.T) {
 	}
 }
 
+// TestHealth_RecentlyClosedMapPrunedAfterTTL asserts two properties of the recentlyClosed
+// prune logic:
+//  1. After noteClosedID(id) and advancing the clock past closedIDTTL, a subsequent
+//     noteClosedID call (for a different id) triggers the sweep and removes the expired entry.
+//  2. After the prune, routing misses for that id count as genuine orphans (not suppressed).
+func TestHealth_RecentlyClosedMapPrunedAfterTTL(t *testing.T) {
+	t0 := time.Unix(1_700_000_000, 0)
+	clock := t0
+	nowFunc = func() time.Time { return clock }
+	t.Cleanup(func() { nowFunc = time.Now })
+
+	var got []string
+	c := &Connection{
+		activeStreams: make(map[uint32]*Stream),
+		config:        ConnectionConfig{OnHealthSignal: func(r string) { got = append(got, r) }},
+	}
+	c.markConnected()
+	clock = t0.Add(startupGrace + time.Second)
+
+	// Record a clean close for id 42 at the current clock.
+	c.noteClosedID(42)
+
+	c.healthMu.Lock()
+	if _, ok := c.recentlyClosed[42]; !ok {
+		c.healthMu.Unlock()
+		t.Fatal("id 42 should be in recentlyClosed immediately after noteClosedID")
+	}
+	c.healthMu.Unlock()
+
+	// Advance clock well past the TTL window.
+	clock = clock.Add(closedIDTTL + time.Second)
+
+	// A subsequent noteClosedID for a different id triggers the sweep — 42 must be pruned.
+	c.noteClosedID(99)
+
+	c.healthMu.Lock()
+	_, has42 := c.recentlyClosed[42]
+	_, has99 := c.recentlyClosed[99]
+	c.healthMu.Unlock()
+	if has42 {
+		t.Fatal("recentlyClosed still contains expired id 42 — prune not working")
+	}
+	if !has99 {
+		t.Fatal("recentlyClosed should still contain recently-added id 99")
+	}
+
+	// Prove genuine-orphan: routing misses for the pruned id must count toward the threshold.
+	for i := 0; i < orphanThreshold; i++ {
+		c.recordRoutingMiss(42)
+	}
+	if len(got) != 1 || got[0] != ReasonRoutingMissOrphan {
+		t.Fatalf("expected one %q after expired-id miss, got %v", ReasonRoutingMissOrphan, got)
+	}
+}
+
 // TestHealth_StandaloneExitGating pins the fix for the nil-callback standalone fallback:
 // self-heal reasons (routing-miss-orphan, stream-drops) MUST call exitFunc; connectivity
 // reasons (reconnect-flap) must NOT call exitFunc (log-only — exiting on a plain network
