@@ -31,6 +31,11 @@ const (
 	preludeCRCOffset    = 8
 	minMessageLength    = preludeLength + 4 // Prelude + Message CRC
 	maxHeaderNameLength = 255
+
+	// maxMessageLength mirrors AWS_EVENT_STREAM_MAX_MESSAGE_SIZE (24 MiB) from
+	// aws-c-event-stream. Bounds allocations when a corrupt or desynced frame
+	// carries a garbage length that would otherwise be trusted.
+	maxMessageLength = 24 * 1024 * 1024
 )
 
 // EncodeMessage encodes a Message into wire format
@@ -97,6 +102,15 @@ func DecodeMessage(reader io.Reader) (*Message, error) {
 
 	if totalLen < minMessageLength {
 		return nil, fmt.Errorf("invalid total length: %d (minimum %d)", totalLen, minMessageLength)
+	}
+	if totalLen > maxMessageLength {
+		return nil, fmt.Errorf("invalid total length: %d (maximum %d)", totalLen, maxMessageLength)
+	}
+	// Guard the uint32 arithmetic below: a headersLen larger than totalLen-16
+	// would underflow payloadLen to ~4 GiB and the allocations would OOM the
+	// process instead of surfacing a protocol error.
+	if headersLen > totalLen-minMessageLength {
+		return nil, fmt.Errorf("invalid headers length: %d (message total %d)", headersLen, totalLen)
 	}
 
 	// Calculate payload length
