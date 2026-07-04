@@ -63,9 +63,9 @@ type ReconnectionConfig struct {
 	OnReconnected func()
 
 	// OnHealthSignal is called when the SDK detects a health-relevant signal, with a
-	// reason string (one of the eventstream.Reason* values, surfaced as ReasonRoutingMissOrphan
-	// / ReasonStreamDrops / ReasonReconnectFlap / ReasonReconnectStuck). If nil, the SDK falls
-	// back to exiting the process on the self-heal reasons (standalone-safe).
+	// reason string: switch on the greengrassipc.Reason* constants
+	// (ReasonRoutingMissOrphan, ReasonStreamDrops, ReasonReconnectFlap, ReasonReconnectStuck).
+	// If nil, the SDK falls back to exiting the process on the self-heal reasons (standalone-safe).
 	OnHealthSignal func(reason string)
 }
 
