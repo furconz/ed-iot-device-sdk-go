@@ -850,6 +850,17 @@ func (c *Connection) Generation() uint64 {
 	return c.gen
 }
 
+// StreamOwner returns the stream registered at id in the activeStreams routing map,
+// along with a boolean indicating whether an entry exists. Used by the D1a tripwire
+// in greengrassipc to assert that a freshly-resubscribed stream is the registered owner
+// of its id (pointer comparison). Reads activeStreams under c.mu.
+func (c *Connection) StreamOwner(id uint32) (*Stream, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s, ok := c.activeStreams[id]
+	return s, ok
+}
+
 // Close closes the connection
 func (c *Connection) Close() error {
 	c.mu.Lock()

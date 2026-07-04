@@ -247,6 +247,11 @@ func (s *Subscription[T]) resubscribe() bool {
 			// Success! Replace the old stream
 			s.stream.Close() // Close old stream
 			s.stream = stream
+			// D1a tripwire: assert this subscription is the registered owner of its id.
+			// With P0 this always holds; a mismatch flags a residual collision.
+			if owner, ok := s.client.conn.StreamOwner(s.stream.ID()); ok && owner != s.stream {
+				logging.Error("D1a: resubscribed stream not registered as owner (label=%q topic=%q stream=%d)", s.label, s.topic, s.stream.ID())
+			}
 			logging.Info("Successfully resubscribed on attempt %d (label=%q topic=%q newStream=%d)",
 				attempt, s.label, s.topic, s.stream.ID())
 			return true
