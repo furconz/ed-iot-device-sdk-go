@@ -4,11 +4,38 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/furconz/ed-iot-device-sdk-go/internal/eventstream"
 	"github.com/furconz/ed-iot-device-sdk-go/internal/logging"
 )
+
+// generationGuard ensures a function runs at most once per connection generation,
+// so subscriptions resubscribe exactly once per reconnect even if multiple
+// connection-error events arrive for the same drop.
+type generationGuard struct {
+	mu   sync.Mutex
+	gen  uint64
+	done bool
+	ok   bool
+}
+
+// once runs fn at most once per generation and returns fn's (cached) result, so
+// callers keep resubscribe's continue-vs-return control flow. Only one
+// processMessages goroutine drives a given subscription's guard, so holding the
+// lock across fn (resubscribe, up to ~30s) is uncontended.
+func (g *generationGuard) once(gen uint64, fn func() bool) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.done && g.gen == gen {
+		return g.ok
+	}
+	g.gen = gen
+	g.done = true
+	g.ok = fn()
+	return g.ok
+}
 
 // Subscription represents a streaming IPC subscription
 //
@@ -27,8 +54,9 @@ type Subscription[T any] struct {
 	client    *Client
 	operation string
 	request   interface{}
-	label     string // caller-supplied label for log disambiguation (may be empty)
-	topic     string // MQTT topic name captured at creation time (SubscribeToIoTCore only)
+	label      string           // caller-supplied label for log disambiguation (may be empty)
+	topic      string           // MQTT topic name captured at creation time (SubscribeToIoTCore only)
+	resubGuard generationGuard  // ensures resubscription fires exactly once per connection generation
 }
 
 // Messages returns a channel that receives subscription messages
@@ -114,13 +142,16 @@ func (s *Subscription[T]) processMessages() {
 			if eventstream.IsConnectionError(err) {
 				logging.Info("Subscription detected connection error, attempting to resubscribe: %v", err)
 
-				// Attempt to resubscribe
-				if s.resubscribe() {
+				// Attempt to resubscribe — guard ensures at most one resubscription attempt
+				// per connection generation, even if multiple error events arrive for the
+				// same reconnect. Cached result (ok/fail) is returned on subsequent calls
+				// with the same generation, preserving the continue-vs-return control flow.
+				if s.resubGuard.once(s.client.conn.Generation(), s.resubscribe) {
 					logging.Info("Subscription resubscribed successfully, resuming message processing")
 					continue
 				}
 
-				// Resubscribe failed, report error and exit
+				// Resubscribe definitively failed — report error and exit
 				logging.Error("Subscription resubscribe failed")
 				select {
 				case s.errors <- err:

@@ -62,6 +62,11 @@ type Connection struct {
 	// Touched only by the single readLoop goroutine — no mutex required.
 	// Survives reconnect because it is a field on *Connection, not on *Stream.
 	droppedAt []time.Time
+
+	// gen is a monotonically increasing counter bumped each time connect() succeeds.
+	// Protected by mu. Subscriptions use it to detect when a new connection has been
+	// established so they resubscribe exactly once per connection generation.
+	gen uint64
 }
 
 // ConnectionConfig holds configuration for establishing a connection
@@ -163,6 +168,7 @@ func (c *Connection) connect(ctx context.Context) error {
 	c.connected = true
 	c.nextStreamID = 1
 	c.activeStreams = make(map[uint32]*Stream)
+	c.gen++
 	c.mu.Unlock()
 
 	c.readMu.Lock()
@@ -656,6 +662,15 @@ func (c *Connection) writeMessage(msg *Message) error {
 	c.pingMu.Unlock()
 
 	return nil
+}
+
+// Generation returns the current connection generation counter, which is
+// incremented each time connect() completes successfully. Subscriptions use
+// this to ensure resubscription fires exactly once per connection generation.
+func (c *Connection) Generation() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gen
 }
 
 // Close closes the connection
