@@ -61,6 +61,12 @@ type ReconnectionConfig struct {
 
 	// OnReconnected is called when connection is successfully re-established
 	OnReconnected func()
+
+	// OnHealthSignal is called when the SDK detects a health-relevant signal, with a
+	// reason string (one of the eventstream.Reason* values, surfaced as ReasonRoutingMissOrphan
+	// / ReasonStreamDrops / ReasonReconnectFlap / ReasonReconnectStuck). If nil, the SDK falls
+	// back to exiting the process on the self-heal reasons (standalone-safe).
+	OnHealthSignal func(reason string)
 }
 
 // NewClient creates a new Greengrass IPC client
@@ -123,6 +129,7 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 		MaxRetries:         reconnectCfg.MaxRetries,
 		OnDisconnected:     reconnectCfg.OnDisconnected,
 		OnReconnected:      reconnectCfg.OnReconnected,
+		OnHealthSignal:     reconnectCfg.OnHealthSignal,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Greengrass IPC: %w", err)
@@ -136,6 +143,14 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 // Close closes the IPC connection
 func (c *Client) Close() error {
 	return c.conn.Close()
+}
+
+// ForceReconnect forces the client to tear down and re-establish its IPC connection.
+// Intended for test/ops use (e.g. exercising the reconnect path or recovering a
+// suspected-deaf connection on demand). No-op if reconnection is disabled or already
+// in progress.
+func (c *Client) ForceReconnect() {
+	c.conn.TriggerReconnect(fmt.Errorf("forced reconnect (test/ops)"))
 }
 
 // requestResponse performs a request-response operation

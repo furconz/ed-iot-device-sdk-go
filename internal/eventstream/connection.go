@@ -24,6 +24,124 @@ const dropWindow = 30 * time.Second
 // dropThreshold is the number of drops within dropWindow that triggers a self-restart.
 const dropThreshold = 10
 
+const (
+	// A genuine orphan = a real command dropped on a wrongly-unregistered stream.
+	// Kept LOW/wide so a persistently-deaf command subscription trips even under
+	// sparse NFC-tap traffic (5/60s would never accumulate for a printer). One
+	// spurious restart is cheap (bias to liveness); the persisted budget bounds loops.
+	orphanWindow    = 10 * time.Minute
+	orphanThreshold = 2
+	closedIDTTL     = 30 * time.Second
+	startupGrace    = 90 * time.Second
+
+	// Connectivity flap/stuck detection (log-only reasons; the nucleus owns reconnection).
+	flapWindow     = 5 * time.Minute
+	flapThreshold  = 5
+	stuckReconnect = 60 * time.Second
+
+	ReasonRoutingMissOrphan = "routing-miss-orphan"
+	ReasonStreamDrops       = "stream-drops"
+	ReasonReconnectFlap     = "reconnect-flap"
+	ReasonReconnectStuck    = "reconnect-stuck"
+)
+
+// markConnected records the time of a successful connect() as the startup-grace anchor.
+func (c *Connection) markConnected() {
+	c.healthMu.Lock()
+	c.connectedAt = nowFunc()
+	c.healthMu.Unlock()
+}
+
+// noteClosedID records that we cleanly closed stream id — used to discriminate QoS1
+// redeliveries (a duplicate for a recently-closed id) from genuine routing-miss orphans.
+// Must be called ONLY for ids we actually owned and closed (inside Close's ownership block).
+func (c *Connection) noteClosedID(id uint32) {
+	c.healthMu.Lock()
+	if c.recentlyClosed == nil {
+		c.recentlyClosed = make(map[uint32]time.Time)
+	}
+	c.recentlyClosed[id] = nowFunc()
+	c.healthMu.Unlock()
+}
+
+// recordRoutingMiss runs on the readLoop goroutine (c.mu already RELEASED at the miss
+// branch) for a NON-ZERO id that missed activeStreams. Counts the miss UNLESS it's a QoS1
+// redelivery for a recently CLEANLY-closed id, past a startup grace, then signals.
+// We deliberately do NOT require "never registered this generation": the deaf command
+// stream's id WAS registered then wrongly unregistered, so a never-registered check would
+// skip the exact bug. A wrongful unregister never records a clean-close, so
+// not-recently-cleanly-closed is the correct discriminator.
+//
+// M2: recentlyClosed/connectedAt/orphanAt are also written by noteClosedID (from Close,
+// under c.mu) and markConnected (from connect, under c.mu). This goroutine holds NEITHER
+// lock here, so those fields are guarded by healthMu. We DECIDE under healthMu, then call
+// suspectHealth OUTSIDE it (the callback must not run under healthMu; it does not re-enter
+// the SDK). Lock order is always c.mu -> healthMu; recordRoutingMiss takes only healthMu,
+// so there is no reverse ordering and no deadlock.
+func (c *Connection) recordRoutingMiss(id uint32) {
+	if id == 0 {
+		return
+	}
+	c.healthMu.Lock()
+	now := nowFunc()
+	signal := false
+	if now.Sub(c.connectedAt) >= startupGrace {
+		if t, ok := c.recentlyClosed[id]; !ok || now.Sub(t) >= closedIDTTL {
+			c.orphanAt = append(c.orphanAt, now)
+			cutoff := now.Add(-orphanWindow)
+			i := 0
+			for i < len(c.orphanAt) && c.orphanAt[i].Before(cutoff) {
+				i++
+			}
+			c.orphanAt = c.orphanAt[i:]
+			if len(c.orphanAt) >= orphanThreshold {
+				c.orphanAt = nil
+				signal = true
+			}
+		}
+	}
+	c.healthMu.Unlock()
+	if signal {
+		c.suspectHealth(ReasonRoutingMissOrphan)
+	}
+}
+
+// recordReconnectSuccess notes a successful reconnect for flap detection. flapThreshold
+// reconnects within flapWindow → one ReasonReconnectFlap signal (log-only). Decides under
+// healthMu, signals outside it.
+func (c *Connection) recordReconnectSuccess() {
+	c.healthMu.Lock()
+	now := nowFunc()
+	c.reconnectAt = append(c.reconnectAt, now)
+	cutoff := now.Add(-flapWindow)
+	i := 0
+	for i < len(c.reconnectAt) && c.reconnectAt[i].Before(cutoff) {
+		i++
+	}
+	c.reconnectAt = c.reconnectAt[i:]
+	signal := false
+	if len(c.reconnectAt) >= flapThreshold {
+		c.reconnectAt = nil
+		signal = true
+	}
+	c.healthMu.Unlock()
+	if signal {
+		c.suspectHealth(ReasonReconnectFlap)
+	}
+}
+
+// suspectHealth routes a signal to the embedder's callback, or falls back to the SDK's
+// own exit when unset (standalone use). Must NOT be called while holding healthMu.
+func (c *Connection) suspectHealth(reason string) {
+	logging.Error("eventstream: health signal (reason=%s)", reason)
+	if c.config.OnHealthSignal != nil {
+		c.config.OnHealthSignal(reason)
+		return
+	}
+	os.Stderr.Sync() //nolint:errcheck
+	exitFunc(1)
+}
+
 // Connection represents an EventStream RPC connection
 type Connection struct {
 	conn   net.Conn
@@ -67,6 +185,16 @@ type Connection struct {
 	// Protected by mu. Subscriptions use it to detect when a new connection has been
 	// established so they resubscribe exactly once per connection generation.
 	gen uint64
+
+	// healthMu guards the deafness/health-detector fields below. These are written by
+	// noteClosedID (from Close, under c.mu) and markConnected (from connect, under c.mu),
+	// and read/written by recordRoutingMiss (on the readLoop goroutine, holding NEITHER
+	// c.mu nor readMu at the miss branch). Lock order is always c.mu -> healthMu.
+	healthMu       sync.Mutex
+	recentlyClosed map[uint32]time.Time // ids we cleanly closed → time closed (QoS1 discriminator)
+	orphanAt       []time.Time          // timestamps of genuine routing-miss orphans (sliding window)
+	connectedAt    time.Time            // last successful connect() — startup grace anchor
+	reconnectAt    []time.Time          // timestamps of successful reconnects (flap sliding window)
 }
 
 // ConnectionConfig holds configuration for establishing a connection
@@ -97,6 +225,11 @@ type ConnectionConfig struct {
 
 	// OnReconnected callback when connection is restored
 	OnReconnected func()
+
+	// OnHealthSignal is called when the SDK detects a health-relevant signal
+	// (genuine routing-miss orphan, sustained stream drops, reconnect flap/stuck).
+	// If nil, the SDK falls back to exitFunc(1) for the self-heal reasons.
+	OnHealthSignal func(reason string)
 }
 
 // Stream represents an EventStream RPC operation stream
@@ -171,6 +304,9 @@ func (c *Connection) connect(ctx context.Context) error {
 	c.gen++
 	c.mu.Unlock()
 
+	// Anchor the startup grace for the routing-miss orphan detector (per-connect).
+	c.markConnected()
+
 	c.readMu.Lock()
 	c.readErr = nil
 	c.incoming = make(chan *Message, 100)
@@ -240,6 +376,11 @@ func (c *Connection) reconnectLoop(ctx context.Context) {
 		maxDelay := 30 * time.Second
 		attempt := 1
 
+		// Stuck-reconnect detection: if a SINGLE reconnect episode spends longer than
+		// stuckReconnect without succeeding, signal ReasonReconnectStuck once (log-only).
+		reconnectStart := nowFunc()
+		stuckSignaled := false
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -263,6 +404,9 @@ func (c *Connection) reconnectLoop(ctx context.Context) {
 				c.reconnecting = false
 				c.reconnectMu.Unlock()
 
+				// Flap detection: flapThreshold reconnects within flapWindow → signal.
+				c.recordReconnectSuccess()
+
 				// Call reconnected callback
 				if c.config.OnReconnected != nil {
 					go c.config.OnReconnected()
@@ -273,6 +417,12 @@ func (c *Connection) reconnectLoop(ctx context.Context) {
 
 			logging.Error("Reconnection attempt %d failed: %v", attempt, err)
 
+			// Stuck detection: fire once per episode when time-in-reconnect crosses the bound.
+			if !stuckSignaled && nowFunc().Sub(reconnectStart) > stuckReconnect {
+				stuckSignaled = true
+				c.suspectHealth(ReasonReconnectStuck)
+			}
+
 			// Increase delay with exponential backoff
 			delay = delay * 2
 			if delay > maxDelay {
@@ -281,6 +431,12 @@ func (c *Connection) reconnectLoop(ctx context.Context) {
 			attempt++
 		}
 	}
+}
+
+// TriggerReconnect is the exported entry point for forcing a reconnect from an
+// embedder (e.g. Client.ForceReconnect for test/ops). It delegates to triggerReconnect.
+func (c *Connection) TriggerReconnect(err error) {
+	c.triggerReconnect(err)
 }
 
 // triggerReconnect signals the reconnection loop to start reconnecting
@@ -616,6 +772,13 @@ func (c *Connection) readLoop() {
 				stream.mu.Unlock()
 			}
 		} else {
+			// No stream registered for this id. For a non-zero id this is a routing
+			// miss — a real frame arrived for a stream that is not in activeStreams.
+			// recordRoutingMiss discriminates genuine orphans (wrongly-unregistered,
+			// RUNNING-but-deaf) from benign QoS1 redeliveries of recently-closed ids.
+			// Zero-id (connection-level) messages are ignored inside recordRoutingMiss.
+			c.recordRoutingMiss(streamID)
+
 			// No specific stream, send to incoming channel (connection-level messages)
 			if msg.Type == MessageTypeProtocolError || msg.Type == MessageTypeInternalError {
 				// Log connection-level errors
@@ -984,6 +1147,12 @@ func (s *Stream) Close() error {
 	if s.idAllocated {
 		if cur, ok := s.conn.activeStreams[s.id]; ok && cur == s {
 			delete(s.conn.activeStreams, s.id)
+			// Record a CLEAN close so a QoS1 redelivery for this id is not mistaken
+			// for a genuine routing-miss orphan. Only inside the ownership block: a
+			// wrongful/no-op delete must NOT poison the recently-closed set, or it
+			// would suppress detection of the exact deafness bug. (Under c.mu here;
+			// noteClosedID takes healthMu — lock order c.mu -> healthMu is preserved.)
+			s.conn.noteClosedID(s.id)
 		}
 	}
 
@@ -1015,14 +1184,14 @@ func (c *Connection) recordStreamDrop() {
 
 	if len(c.droppedAt) >= dropThreshold {
 		logging.Error(
-			"eventstream: %d inbound messages dropped within %s — consumer stalled; exiting to trigger Greengrass restart",
+			"eventstream: %d inbound messages dropped within %s — consumer stalled; signalling health",
 			len(c.droppedAt),
 			dropWindow,
 		)
-		// Flush stderr so the log line reaches Greengrass LogManager before the process dies.
-		// os.Stderr.Sync() returns EINVAL on a TTY in local dev but succeeds under Greengrass's
-		// pipe to LogManager; ignore the return value in both cases.
-		os.Stderr.Sync() //nolint:errcheck
-		exitFunc(1)
+		// Reset so a subsequent breach signals afresh rather than re-firing every drop.
+		c.droppedAt = nil
+		// Route through the health path: the embedder's OnHealthSignal decides how to
+		// self-heal, or the SDK falls back to exitFunc(1) (which flushes stderr) standalone.
+		c.suspectHealth(ReasonStreamDrops)
 	}
 }
