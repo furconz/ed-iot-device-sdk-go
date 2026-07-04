@@ -196,16 +196,16 @@ func (s *Subscription[T]) resubscribe() bool {
 		cancel()
 
 		if err != nil {
-			logging.Error("Resubscribe attempt %d (label=%q topic=%q): connection not ready: %v",
-				attempt, s.label, s.topic, err)
+			logging.Error("Resubscribe attempt %d (label=%q topic=%q stream=%d): connection not ready: %v",
+				attempt, s.label, s.topic, s.stream.ID(), err)
 			if attempt < maxAttempts {
 				time.Sleep(time.Second * time.Duration(attempt))
 			}
 			continue
 		}
 
-		logging.Info("Connection ready, creating new stream for resubscribe attempt %d (label=%q topic=%q)",
-			attempt, s.label, s.topic)
+		logging.Info("Connection ready, creating new stream for resubscribe attempt %d (label=%q topic=%q stream=%d)",
+			attempt, s.label, s.topic, s.stream.ID())
 
 		// NOW it's safe to create stream
 		stream := s.client.conn.NewStream(s.operation)
