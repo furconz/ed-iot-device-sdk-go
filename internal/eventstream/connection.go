@@ -272,6 +272,12 @@ type Stream struct {
 	active     bool
 	closed     bool // tracks if done channel has been closed
 	idAllocated bool // tracks if stream ID has been allocated (set in Activate)
+	// peerTerminated: the server sent TERMINATE_STREAM on this stream, so its
+	// continuation is already removed server-side. The deployed nucleus
+	// (aws-c-event-stream v0.5.0) hard-closes the whole connection with a
+	// "stream-id ... lower than the last seen" protocol error if we write this
+	// stream-id again — Close must never echo a TERMINATE once this is set.
+	peerTerminated bool
 	messages   chan *Message
 	errors     chan error
 	done       chan struct{}
@@ -763,6 +769,18 @@ func (c *Connection) readLoop() {
 		c.mu.Unlock()
 
 		if exists {
+			// CRITICAL: if this message carries TERMINATE_STREAM, the server has
+			// already removed its continuation for this stream-id. Record that
+			// BEFORE delivering the message, so a consumer that immediately calls
+			// Close() cannot win the race against the closed-marking further down
+			// and echo a TERMINATE the nucleus rejects as a non-monotonic
+			// stream-id (fatal connection-level protocol error).
+			if msg.Flags.HasFlag(MessageFlagTerminateStream) {
+				stream.mu.Lock()
+				stream.peerTerminated = true
+				stream.mu.Unlock()
+			}
+
 			// Check for error response FIRST (before checking termination flag)
 			// This ensures we log the error even if TERMINATE_STREAM flag is also set
 			if msg.Type == MessageTypeApplicationError {
@@ -1161,7 +1179,9 @@ func (s *Stream) Close() error {
 	// Only send TERMINATE if:
 	// 1. Stream ID was allocated (stream was activated)
 	// 2. Stream wasn't already closed by readLoop
-	if s.idAllocated && !s.closed {
+	// 3. The server hasn't already terminated the stream (its continuation is
+	//    gone; writing the id again is a fatal protocol error on the nucleus)
+	if s.idAllocated && !s.closed && !s.peerTerminated {
 		msg := CreateMessageWithStreamID(MessageTypeApplicationMessage, MessageFlagTerminateStream, s.id, nil)
 		if err := s.conn.writeMessage(msg); err != nil {
 			logging.Error("Failed to send TERMINATE for stream %d: %v", s.id, err)
@@ -1177,7 +1197,13 @@ func (s *Stream) Close() error {
 			s.closed = true
 		}
 	} else {
-		logging.Debug("Stream %d already closed by readLoop, skipping TERMINATE", s.id)
+		logging.Debug("Stream %d already closed or peer-terminated, skipping TERMINATE", s.id)
+		// A Close that won the delivery race (peerTerminated set, closed not yet)
+		// must still complete the done-channel lifecycle it is skipping above.
+		if !s.closed {
+			close(s.done)
+			s.closed = true
+		}
 	}
 
 	// Remove from active streams only if THIS stream is still the registered
