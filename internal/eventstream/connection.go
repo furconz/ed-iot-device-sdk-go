@@ -955,9 +955,15 @@ func (s *Stream) Close() error {
 		logging.Debug("Stream %d already closed by readLoop, skipping TERMINATE", s.id)
 	}
 
-	// Remove from active streams only if ID was allocated
+	// Remove from active streams only if THIS stream is still the registered
+	// owner of its id. After a reconnect resets nextStreamID and installs a
+	// fresh map, a stale stream's id may have been reused by a live stream —
+	// an unconditional delete would silently unregister that live subscription
+	// (RUNNING-but-deaf). See connection_p0_test.go.
 	if s.idAllocated {
-		delete(s.conn.activeStreams, s.id)
+		if cur, ok := s.conn.activeStreams[s.id]; ok && cur == s {
+			delete(s.conn.activeStreams, s.id)
+		}
 	}
 
 	s.conn.mu.Unlock()
