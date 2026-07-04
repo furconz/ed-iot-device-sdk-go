@@ -131,15 +131,27 @@ func (c *Connection) recordReconnectSuccess() {
 }
 
 // suspectHealth routes a signal to the embedder's callback, or falls back to the SDK's
-// own exit when unset (standalone use). Must NOT be called while holding healthMu.
+// own standalone behaviour when unset: exits (os.Stderr.Sync + exitFunc(1)) on the
+// self-heal reasons (ReasonRoutingMissOrphan, ReasonStreamDrops), and logs only on the
+// connectivity reasons (ReasonReconnectFlap, ReasonReconnectStuck) — exiting on a plain
+// network outage would crash-loop an offline device, which the design explicitly forbids.
+// Must NOT be called while holding healthMu.
 func (c *Connection) suspectHealth(reason string) {
 	logging.Error("eventstream: health signal (reason=%s)", reason)
 	if c.config.OnHealthSignal != nil {
 		c.config.OnHealthSignal(reason)
 		return
 	}
-	os.Stderr.Sync() //nolint:errcheck
-	exitFunc(1)
+	// Standalone fallback: exit only on genuine deafness reasons.
+	// Connectivity reasons (flap/stuck) represent a plain network outage —
+	// the reconnect loop owns recovery; exiting here would crash-loop an offline device.
+	switch reason {
+	case ReasonRoutingMissOrphan, ReasonStreamDrops:
+		os.Stderr.Sync() //nolint:errcheck
+		exitFunc(1)
+	default:
+		// ReasonReconnectFlap / ReasonReconnectStuck: already logged above; no exit.
+	}
 }
 
 // Connection represents an EventStream RPC connection
@@ -228,7 +240,9 @@ type ConnectionConfig struct {
 
 	// OnHealthSignal is called when the SDK detects a health-relevant signal
 	// (genuine routing-miss orphan, sustained stream drops, reconnect flap/stuck).
-	// If nil, the SDK falls back to exitFunc(1) for the self-heal reasons.
+	// If nil, the SDK falls back to standalone behaviour: exits (exitFunc(1)) on the
+	// self-heal reasons (ReasonRoutingMissOrphan, ReasonStreamDrops) and logs only on
+	// the connectivity reasons (ReasonReconnectFlap, ReasonReconnectStuck).
 	OnHealthSignal func(reason string)
 }
 
