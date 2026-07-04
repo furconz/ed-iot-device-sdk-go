@@ -205,7 +205,8 @@ type Connection struct {
 	pingMu       sync.Mutex
 
 	// droppedAt records the timestamps of stream-level message drops (stream.messages full).
-	// Touched only by the single readLoop goroutine — no mutex required.
+	// Guarded by healthMu: readLoops of adjacent generations can overlap briefly
+	// around a reconnect, so this is no longer single-goroutine.
 	// Survives reconnect because it is a field on *Connection, not on *Stream.
 	droppedAt []time.Time
 
@@ -325,20 +326,68 @@ func (c *Connection) connect(ctx context.Context) error {
 	}
 	logging.Info("Socket connected successfully")
 
-	c.conn = conn
-
-	// Perform handshake
-	if err := c.handshake(ctx); err != nil {
+	// Handshake on the LOCAL conn before publishing it anywhere: until CONNACK
+	// is accepted, no other goroutine may see (and write to) the new socket.
+	if err := c.handshake(ctx, conn); err != nil {
 		conn.Close()
 		return fmt.Errorf("handshake failed: %w", err)
 	}
 
 	c.mu.Lock()
+	oldConn := c.conn
+
+	// Snapshot any streams still registered from the previous generation. Their
+	// reader (the stale readLoop) exits without teardown once gen moves on, so
+	// their consumers must be woken (below, after c.mu is released — closing
+	// them here would invert the stream.mu → c.mu order used by Activate/Close
+	// and deadlock). In the common path (readLoop died and triggered this
+	// reconnect) the old loop already failed them and the map is empty.
+	oldStreams := make([]*Stream, 0, len(c.activeStreams))
+	for _, stream := range c.activeStreams {
+		oldStreams = append(oldStreams, stream)
+	}
+
+	// Publish the new socket atomically with the stream-id counter reset and the
+	// generation bump. Activate runs entirely under c.mu, so it can never pair an
+	// old counter value with the new socket (the pre-fix reconnect-window bug:
+	// nucleus sees e.g. id 87 first, then post-reset id 1 → fatal "lower than
+	// last seen" protocol error). writeMu is taken for the field store because
+	// writeMessage reads c.conn under writeMu alone; lock order c.mu → writeMu
+	// matches Activate/Close → writeMessage.
+	c.writeMu.Lock()
+	c.conn = conn
+	c.writeMu.Unlock()
 	c.connected = true
 	c.nextStreamID = 1
 	c.activeStreams = make(map[uint32]*Stream)
 	c.gen++
+	gen := c.gen
 	c.mu.Unlock()
+
+	// Fail the previous generation's streams (outside c.mu; see snapshot above).
+	// Idempotent against the old readLoop's own sweep via the closed guard.
+	if len(oldStreams) > 0 {
+		replacedErr := &ConnectionError{Err: fmt.Errorf("connection replaced by reconnect")}
+		for _, stream := range oldStreams {
+			select {
+			case stream.errors <- replacedErr:
+			default:
+			}
+			stream.mu.Lock()
+			if !stream.closed {
+				close(stream.done)
+				stream.closed = true
+			}
+			stream.mu.Unlock()
+		}
+	}
+
+	// Unblock a stale readLoop still parked in DecodeMessage on the old socket
+	// (possible when this reconnect was triggered by a write failure rather than
+	// a read error); it exits via the generation check without touching state.
+	if oldConn != nil && oldConn != conn {
+		oldConn.Close()
+	}
 
 	// Anchor the startup grace for the routing-miss orphan detector (per-connect).
 	c.markConnected()
@@ -367,12 +416,12 @@ func (c *Connection) connect(ctx context.Context) error {
 	}
 	c.reconnectedMu.Unlock()
 
-	// Start message reader
-	go c.readLoop()
+	// Start message reader for THIS conn/generation
+	go c.readLoop(conn, gen)
 
 	// Start ping loop if keepalive enabled and not disabled
 	if c.config.PingInterval > 0 && !c.config.DisablePingPong {
-		go c.pingLoop()
+		go c.pingLoop(conn, gen)
 		logging.Debug("Ping loop enabled (interval: %v, timeout: %v)", c.config.PingInterval, c.config.PingTimeout)
 	} else if c.config.DisablePingPong {
 		logging.Debug("Ping loop disabled by configuration")
@@ -522,8 +571,11 @@ func (c *Connection) WaitUntilReady(ctx context.Context) error {
 	}
 }
 
-// pingLoop sends periodic keepalive pings and checks for stale connections
-func (c *Connection) pingLoop() {
+// pingLoop sends periodic keepalive pings and checks for stale connections.
+// Like readLoop it owns one generation: it exits when gen moves on (a stale
+// loop pinging the successor socket would corrupt the new loop's ping
+// bookkeeping) and closes only its own captured conn on timeout.
+func (c *Connection) pingLoop(conn net.Conn, gen uint64) {
 	logging.Debug("Ping loop started (interval: %v, timeout: %v)", c.config.PingInterval, c.config.PingTimeout)
 
 	ticker := time.NewTicker(c.config.PingInterval)
@@ -532,13 +584,13 @@ func (c *Connection) pingLoop() {
 	for {
 		<-ticker.C
 
-		// Check if connection is still active
+		// Check if this generation's connection is still active
 		c.mu.Lock()
-		connected := c.connected
+		connected := c.connected && c.gen == gen
 		c.mu.Unlock()
 
 		if !connected {
-			logging.Debug("Ping loop exiting: connection not active")
+			logging.Debug("Ping loop exiting: connection not active or superseded")
 			return
 		}
 
@@ -562,10 +614,8 @@ func (c *Connection) pingLoop() {
 			if timeSincePing > c.config.PingTimeout {
 				logging.Error("Ping timeout: no pong received for %v after sending ping (timeout: %v)",
 					timeSincePing, c.config.PingTimeout)
-				// Close connection to trigger reconnection
-				if c.conn != nil {
-					c.conn.Close()
-				}
+				// Close this generation's connection to trigger reconnection
+				conn.Close()
 				return
 			}
 
@@ -592,8 +642,10 @@ func (c *Connection) pingLoop() {
 	}
 }
 
-// handshake performs the CONNECT/CONNACK handshake
-func (c *Connection) handshake(ctx context.Context) error {
+// handshake performs the CONNECT/CONNACK handshake on the given (not yet
+// published) conn. It writes directly rather than via writeMessage so it can
+// never race an in-flight writer of the previous generation's socket.
+func (c *Connection) handshake(ctx context.Context, conn net.Conn) error {
 	// Create CONNECT message
 	connectReq := ConnectRequest{
 		AuthToken: c.config.AuthToken,
@@ -613,9 +665,13 @@ func (c *Connection) handshake(ctx context.Context) error {
 		logging.Debug("Sending Header[%d]: name=%s type=%d value=%v", i, h.Name, h.Type, h.Value)
 	}
 
-	// Send CONNECT
-	if err := c.writeMessage(connectMsg); err != nil {
-		return fmt.Errorf("failed to send CONNECT: %w", err)
+	// Send CONNECT (directly on the unpublished conn)
+	encoded, err := EncodeMessage(connectMsg)
+	if err != nil {
+		return fmt.Errorf("failed to encode CONNECT: %w", err)
+	}
+	if _, err := conn.Write(encoded); err != nil {
+		return fmt.Errorf("failed to send CONNECT: %w", WrapIfConnectionError(err))
 	}
 
 	logging.Debug("CONNECT sent, waiting for CONNACK...")
@@ -625,7 +681,7 @@ func (c *Connection) handshake(ctx context.Context) error {
 	errChan := make(chan error, 1)
 
 	go func() {
-		msg, err := DecodeMessage(c.conn)
+		msg, err := DecodeMessage(conn)
 		if err != nil {
 			errChan <- err
 			return
@@ -672,32 +728,62 @@ func (c *Connection) handshake(ctx context.Context) error {
 	return nil
 }
 
-// readLoop continuously reads messages from the connection
-func (c *Connection) readLoop() {
+// readLoop continuously reads messages from conn. It owns exactly one
+// connection generation: conn is captured at spawn (never re-read from c.conn,
+// which a concurrent reconnect may swap) and gen gates the error-path teardown
+// so a stale loop can never tear down a successor connection's state — the
+// pre-fix failure mode where an old readLoop, unblocked after a
+// write-failure-triggered reconnect, errored out all the NEW streams and closed
+// the NEW incoming channel (or decoded the new socket concurrently with the new
+// readLoop, desyncing the frame stream).
+func (c *Connection) readLoop(conn net.Conn, gen uint64) {
 	for {
-		msg, err := DecodeMessage(c.conn)
+		msg, err := DecodeMessage(conn)
 		if err != nil {
+			// Only the current generation's readLoop may tear down shared state.
+			c.mu.Lock()
+			if c.gen != gen {
+				c.mu.Unlock()
+				logging.Debug("Stale readLoop (gen %d, current %d) exiting without teardown", gen, c.gen)
+				return
+			}
+
 			logging.Error("DecodeMessage error: %v", err)
 
 			// Wrap as connection error if it's a network error
 			wrappedErr := WrapIfConnectionError(err)
 
+			// State flips happen in one c.mu critical section so a concurrent
+			// connect() (which bumps gen under c.mu) serializes entirely before
+			// or after it. The nested locks below are leaves: nothing acquires
+			// c.mu while holding readMu/reconnectedMu, so ordering is safe.
+			c.connected = false
+
 			c.readMu.Lock()
 			c.readErr = wrappedErr
 			c.readMu.Unlock()
 
-			// Create new reconnection signal BEFORE marking disconnected
-			// This ensures operations that check readiness will block until reconnection succeeds
+			// New (open) reconnection signal = not ready; operations that check
+			// readiness will block until reconnection succeeds.
 			c.reconnectedMu.Lock()
-			c.reconnectedChan = make(chan struct{}) // Open channel = not ready
+			c.reconnectedChan = make(chan struct{})
 			c.reconnectedMu.Unlock()
 
-			// Mark connection as not connected
-			c.mu.Lock()
-			c.connected = false
-
-			// Close all active streams
+			// Snapshot the streams to fail, but DO NOT touch stream.mu while
+			// holding c.mu: Activate and Close acquire stream.mu THEN c.mu, so
+			// closing streams under c.mu is a lock-order inversion that
+			// deadlocks the whole connection (surfaced by the reconnect churn
+			// test; latent in the pre-generation code as well).
+			streams := make([]*Stream, 0, len(c.activeStreams))
 			for _, stream := range c.activeStreams {
+				streams = append(streams, stream)
+			}
+			incoming := c.incoming
+			c.mu.Unlock()
+
+			// Fail the snapshot outside c.mu. Idempotent against a concurrent
+			// sweep or Close via the stream.closed guard.
+			for _, stream := range streams {
 				select {
 				case stream.errors <- wrappedErr:
 				default:
@@ -709,15 +795,26 @@ func (c *Connection) readLoop() {
 				}
 				stream.mu.Unlock()
 			}
-			c.mu.Unlock()
 
-			close(c.incoming)
+			close(incoming)
 
 			// Trigger reconnection if enabled and it's a connection error
 			if IsConnectionError(wrappedErr) {
 				c.triggerReconnect(wrappedErr)
 			}
 
+			return
+		}
+
+		// A message decoded from a socket the connection has moved on from must
+		// not be routed: stream ids overlap across generations, so an old-socket
+		// frame could be delivered to an unrelated new stream (and a stale pong
+		// or drop-record would corrupt the new generation's bookkeeping).
+		c.mu.Lock()
+		stale := c.gen != gen
+		c.mu.Unlock()
+		if stale {
+			logging.Debug("Stale readLoop (gen %d) discarding message and exiting", gen)
 			return
 		}
 
@@ -843,7 +940,10 @@ func (c *Connection) readLoop() {
 	}
 }
 
-// writeMessage sends a message on the connection
+// writeMessage sends a message on the connection.
+// Reads c.conn under writeMu: connect() publishes a new conn while holding
+// BOTH c.mu and writeMu, so this read is race-free whether the caller holds
+// c.mu (Activate/Close) or not (ping/pong paths).
 func (c *Connection) writeMessage(msg *Message) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -898,21 +998,35 @@ func (c *Connection) StreamOwner(id uint32) (*Stream, bool) {
 // Close closes the connection
 func (c *Connection) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	if !c.connected {
+		c.mu.Unlock()
 		return nil
 	}
 
 	c.connected = false
 
-	// Close all active streams
+	// Snapshot streams; close them outside c.mu (stream.mu → c.mu is the order
+	// used by Activate/Stream.Close) and guard against a readLoop teardown that
+	// already closed them.
+	streams := make([]*Stream, 0, len(c.activeStreams))
 	for _, stream := range c.activeStreams {
-		close(stream.done)
+		streams = append(streams, stream)
 	}
 	c.activeStreams = nil
+	conn := c.conn
+	c.mu.Unlock()
 
-	return c.conn.Close()
+	for _, stream := range streams {
+		stream.mu.Lock()
+		if !stream.closed {
+			close(stream.done)
+			stream.closed = true
+		}
+		stream.mu.Unlock()
+	}
+
+	return conn.Close()
 }
 
 // NewStream creates a new operation stream
@@ -1108,6 +1222,15 @@ func (s *Stream) Activate(ctx context.Context, request interface{}) error {
 	// This prevents race conditions where stream N+1 sends before stream N
 	s.conn.mu.Lock()
 
+	// Never allocate against a connection that is down or mid-reconnect: the id
+	// would come from a counter about to be reset (or the write would land on a
+	// dead/foreign socket). ConnectionError makes RequestResponse retry after
+	// WaitUntilReady and subscription resubscribe treat it as retriable.
+	if !s.conn.connected {
+		s.conn.mu.Unlock()
+		return &ConnectionError{Err: fmt.Errorf("connection not ready (reconnect in progress)")}
+	}
+
 	// Allocate stream ID if not already allocated
 	if !s.idAllocated {
 		s.id = s.conn.nextStreamID
@@ -1235,9 +1358,11 @@ func (s *Stream) Close() error {
 // recordStreamDrop records a stream-level message drop (stream.messages channel full)
 // and triggers a self-restart via exitFunc(1) if dropThreshold drops occur within dropWindow.
 //
-// Must only be called from the readLoop goroutine — no mutex is needed because droppedAt
-// is a field on *Connection (survives reconnect) and is accessed from a single goroutine.
+// Called from readLoop goroutines; guarded by healthMu because readLoops of adjacent
+// generations can overlap briefly around a reconnect. Decides under healthMu, signals
+// outside it (same discipline as the other detectors; healthMu is a leaf lock).
 func (c *Connection) recordStreamDrop() {
+	c.healthMu.Lock()
 	now := nowFunc()
 	c.droppedAt = append(c.droppedAt, now)
 
@@ -1249,14 +1374,21 @@ func (c *Connection) recordStreamDrop() {
 	}
 	c.droppedAt = c.droppedAt[i:]
 
-	if len(c.droppedAt) >= dropThreshold {
-		logging.Error(
-			"eventstream: %d inbound messages dropped within %s — consumer stalled; signalling health",
-			len(c.droppedAt),
-			dropWindow,
-		)
+	signal := false
+	dropped := len(c.droppedAt)
+	if dropped >= dropThreshold {
 		// Reset so a subsequent breach signals afresh rather than re-firing every drop.
 		c.droppedAt = nil
+		signal = true
+	}
+	c.healthMu.Unlock()
+
+	if signal {
+		logging.Error(
+			"eventstream: %d inbound messages dropped within %s — consumer stalled; signalling health",
+			dropped,
+			dropWindow,
+		)
 		// Route through the health path: the embedder's OnHealthSignal decides how to
 		// self-heal, or the SDK falls back to exitFunc(1) (which flushes stderr) standalone.
 		c.suspectHealth(ReasonStreamDrops)
