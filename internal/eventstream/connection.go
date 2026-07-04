@@ -918,6 +918,12 @@ func (s *Stream) Done() <-chan struct{} {
 	return s.done
 }
 
+// ID returns the numeric stream ID allocated during Activate.
+// Returns 0 before Activate is called.
+func (s *Stream) ID() uint32 {
+	return s.id
+}
+
 // Close closes the stream
 func (s *Stream) Close() error {
 	s.mu.Lock()

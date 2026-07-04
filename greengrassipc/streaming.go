@@ -27,6 +27,8 @@ type Subscription[T any] struct {
 	client    *Client
 	operation string
 	request   interface{}
+	label     string // caller-supplied label for log disambiguation (may be empty)
+	topic     string // MQTT topic name captured at creation time (SubscribeToIoTCore only)
 }
 
 // Messages returns a channel that receives subscription messages
@@ -50,9 +52,26 @@ func (s *Subscription[T]) Close() error {
 	return s.stream.Close()
 }
 
-// newSubscription creates a new subscription
+// newSubscription creates a new subscription with no label.
+// Delegates to newSubscriptionWithLabel with an empty label.
 func newSubscription[T any](ctx context.Context, client *Client, operation string, request interface{}, stream *eventstream.Stream) *Subscription[T] {
+	return newSubscriptionWithLabel[T](ctx, client, operation, request, stream, "")
+}
+
+// newSubscriptionWithLabel creates a new subscription with an optional caller-supplied label.
+// The label is included in resubscribe log lines to distinguish subscriptions that share
+// the same operation name (e.g. two aws.greengrass#SubscribeToIoTCore subscriptions on
+// different topics). For IoTCore subscriptions the topic is extracted from req.TopicName
+// when the request is a *SubscribeToIoTCoreRequest; for all other subscription types the
+// topic field is left empty.
+func newSubscriptionWithLabel[T any](ctx context.Context, client *Client, operation string, request interface{}, stream *eventstream.Stream, label string) *Subscription[T] {
 	subCtx, cancel := context.WithCancel(ctx)
+
+	topic := ""
+	if iotReq, ok := request.(*SubscribeToIoTCoreRequest); ok {
+		topic = iotReq.TopicName
+	}
+
 	sub := &Subscription[T]{
 		stream:    stream,
 		messages:  make(chan T, 10),
@@ -63,6 +82,8 @@ func newSubscription[T any](ctx context.Context, client *Client, operation strin
 		client:    client,
 		operation: operation,
 		request:   request,
+		label:     label,
+		topic:     topic,
 	}
 
 	// Start message processing goroutine
@@ -165,7 +186,8 @@ func (s *Subscription[T]) resubscribe() bool {
 		default:
 		}
 
-		logging.Info("Resubscribe attempt %d/%d for operation %s - waiting for connection...", attempt, maxAttempts, s.operation)
+		logging.Info("Resubscribe attempt %d/%d for operation %s (label=%q topic=%q stream=%d) - waiting for connection...",
+			attempt, maxAttempts, s.operation, s.label, s.topic, s.stream.ID())
 
 		// Wait for connection to be ready before attempting to resubscribe
 		// Use a timeout to avoid infinite wait
@@ -174,14 +196,16 @@ func (s *Subscription[T]) resubscribe() bool {
 		cancel()
 
 		if err != nil {
-			logging.Error("Resubscribe attempt %d: connection not ready: %v", attempt, err)
+			logging.Error("Resubscribe attempt %d (label=%q topic=%q): connection not ready: %v",
+				attempt, s.label, s.topic, err)
 			if attempt < maxAttempts {
 				time.Sleep(time.Second * time.Duration(attempt))
 			}
 			continue
 		}
 
-		logging.Info("Connection ready, creating new stream for resubscribe attempt %d", attempt)
+		logging.Info("Connection ready, creating new stream for resubscribe attempt %d (label=%q topic=%q)",
+			attempt, s.label, s.topic)
 
 		// NOW it's safe to create stream
 		stream := s.client.conn.NewStream(s.operation)
@@ -192,11 +216,13 @@ func (s *Subscription[T]) resubscribe() bool {
 			// Success! Replace the old stream
 			s.stream.Close() // Close old stream
 			s.stream = stream
-			logging.Info("Successfully resubscribed on attempt %d", attempt)
+			logging.Info("Successfully resubscribed on attempt %d (label=%q topic=%q newStream=%d)",
+				attempt, s.label, s.topic, s.stream.ID())
 			return true
 		}
 
-		logging.Error("Resubscribe attempt %d failed: %v", attempt, err)
+		logging.Error("Resubscribe attempt %d failed (label=%q topic=%q): %v",
+			attempt, s.label, s.topic, err)
 
 		// Don't retry on non-connection errors
 		if !eventstream.IsConnectionError(err) {
@@ -245,12 +271,22 @@ func (s *Subscription[T]) resubscribe() bool {
 //	    }
 //	}
 func (c *Client) SubscribeToIoTCore(ctx context.Context, req *SubscribeToIoTCoreRequest) (*Subscription[IoTCoreMessage], error) {
+	return c.SubscribeToIoTCoreWithLabel(ctx, req, "")
+}
+
+// SubscribeToIoTCoreWithLabel subscribes to messages from AWS IoT Core with a caller-supplied
+// label that appears in reconnect/resubscribe log lines.
+//
+// When two subscriptions share the same operation name (aws.greengrass#SubscribeToIoTCore),
+// the label lets operators identify which subscription is resubscribing without ambiguity.
+// Pass an empty string to get the same behaviour as SubscribeToIoTCore.
+func (c *Client) SubscribeToIoTCoreWithLabel(ctx context.Context, req *SubscribeToIoTCoreRequest, label string) (*Subscription[IoTCoreMessage], error) {
 	stream := c.conn.NewStream(opSubscribeToIoTCore)
 	if err := stream.Activate(ctx, req); err != nil {
 		return nil, fmt.Errorf("failed to activate subscription: %w", err)
 	}
 
-	return newSubscription[IoTCoreMessage](ctx, c, opSubscribeToIoTCore, req, stream), nil
+	return newSubscriptionWithLabel[IoTCoreMessage](ctx, c, opSubscribeToIoTCore, req, stream, label), nil
 }
 
 // SubscribeToTopic subscribes to messages from a local Greengrass topic
